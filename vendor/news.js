@@ -46,13 +46,30 @@ window.NewsTickers = (function () {
     if (/^[A-Z]{2}\d{1,2}Y\.US$/.test(sym)) return sym.replace(/\.US$/, '.GBOND');
     return sym;
   };
+  // Binance's leveraged tokens (BTCUP, ETHDOWN, BNBBULL, XRPBEAR...), delisted
+  // long ago: EODHD has no price for them ("close": "NA"), and the crypto feed
+  // tags most stories with them -- the Crypto tab read "AAVEDOWN-USD,
+  // AAVEUP-USD, ACM-USD..." and the AI digest was refused for them.
+  // Named by the coins they were issued on, so a coin whose own code ends in
+  // UP or BULL (JUP, SYRUP, PITBULL) is not taken for one.
+  const LEVERAGED = /^(?:1INCH|AAVE|ADA|BCH|BNB|BTC|DOT|EOS|ETH|FIL|LINK|LTC|SUSHI|SXP|TRX|UNI|XLM|XRP|XTZ|YFI)(?:UP|DOWN|BULL|BEAR)-[A-Z]+\.CC$/;
+  // A crypto story tagged with dozens of pairs (AAVE.., ACM, AION, AKRO..., cut
+  // at 50) carries a catalogue, not what it is about. Measured on 200 stories
+  // of the BTC and ETH feeds: with the leveraged tokens out, a story
+  // lists 0-11 pairs or 19-38, nothing between. Above CATALOGUE its pairs are
+  // left out (the page's own symbol stays). Only pairs are counted: an equity
+  // story lists up to 50 symbols too, as cross-listings, and is not touched.
+  const CATALOGUE = 15;
   function primary(symbols, max, focus) {
     const seen = new Set();
-    const list = (Array.isArray(symbols) ? symbols : [])
-      .map(s => fix(String(s || '').trim().toUpperCase()))
-      .filter(s => s && !seen.has(s) && seen.add(s));
-    const best = list.some(s => rank(s) < 3) ? list.filter(s => rank(s) < 3) : list;
     const f = focus ? String(focus).toUpperCase() : null;
+    let list = (Array.isArray(symbols) ? symbols : [])
+      .map(s => fix(String(s || '').trim().toUpperCase()))
+      .filter(s => s && !LEVERAGED.test(s) && !seen.has(s) && seen.add(s));
+    if (list.filter(s => s.endsWith('.CC')).length > CATALOGUE) {
+      list = list.filter(s => s === f || !s.endsWith('.CC'));
+    }
+    const best = list.some(s => rank(s) < 3) ? list.filter(s => rank(s) < 3) : list;
     const sorted = best
       .map((s, i) => ({ s, i, r: s === f ? -1 : rank(s) }))
       .sort((a, b) => (a.r - b.r) || (a.i - b.i))
@@ -782,6 +799,7 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
                                   <span style={{ whiteSpace: 'nowrap' }}>{formatDate(item.date)}</span>
                                   {item.symbols && item.symbols.length > 0 && (() => {
                                     const tags = window.NewsTickers.primary(item.symbols);
+                                    if (tags.length === 0) return null;   // only a catalogue of crypto pairs
                                     return (
                                       <>
                                         <span aria-hidden="true">•</span>

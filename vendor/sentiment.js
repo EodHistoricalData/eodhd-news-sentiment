@@ -1326,7 +1326,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
 
         {/* Search input */}
         {showSearch && (
-          <div style={{ ...cardStyle, marginBottom: 12 }}>
+          <div data-field-card="" style={{ ...cardStyle, marginBottom: 12 }}>
             {/* The suggestions were <div onClick> with nothing else: Tab went
                 from the field straight past them to the close buttons, Enter in
                 the field did nothing, and a ticker could not be added from the
@@ -1334,6 +1334,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                 Enter takes the highlighted row -- or the only one, when the
                 list has settled on a single match. */}
             <input {...window.TickerFieldProps}
+              data-field-snug=""
               type="text"
               value={searchQuery}
               onChange={(e) => {
@@ -1646,8 +1647,11 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
               ) : newsBreakdown && newsBreakdown.failed ? (
                 <div style={{ ...cardStyle, padding: 20, textAlign: 'center', fontSize: 13 }}>
                   <div style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: 10 }}>
+                    {/* A dropped connection or a timeout (status 0) is named
+                        too: it read "Could not load news for AAPL." with no
+                        reason. */}
                     Could not load news for {window.SentimentTickerLabel(selectedTicker, trackedTickers)}{tickerNewsLimited ? ': ' + RLW.REACHED
-                      : (newsBreakdown.fail && !newsBreakdown.fail.limited && (newsBreakdown.fail.status || newsBreakdown.fail.unreadable)) ? ': ' + RLW.failReason(newsBreakdown.fail) : '.'} This is a failed request, not an absence of news.
+                      : (newsBreakdown.fail && !newsBreakdown.fail.limited) ? ': ' + RLW.failReason(newsBreakdown.fail) : '.'} This is a failed request, not an absence of news.
                   </div>
                   {/* A press inside the wait says why next to this button:
                       the page's own note is up in the gauge card, out of
