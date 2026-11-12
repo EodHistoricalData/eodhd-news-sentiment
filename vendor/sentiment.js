@@ -417,6 +417,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     resultsRowsRef.current = [];
     setSearchLoading(false);
     setAddNote(null);
+    // And what the limit stopped: a code Enter asked for before the panel
+    // was closed was checked and added by itself once the wait was over,
+    // the panel shut or open on another text.
+    setSearchLimit(null);
   };
   const closeAddPanel = () => {
     endSearch();
@@ -486,30 +490,64 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       return window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()
         ? null : 'The ticker search was refused for this key or plan.';
     }
-    // Not "a minute": the wait is Retry-After's, counted down on the screen's
-    // Try again and in the notice above; a second number here disagreed
-    // with it.
-    if (kind === 'limited') return window.RateLimitWait.REACHED + ' Press Enter to search again when the wait is over.';
+    // Not "a minute": the wait is Retry-After's, counted down on the
+    // Try again under the line. In the shared picker's
+    // words; it read "Press Enter to search again when the wait is over",
+    // with no count, while the search ran again by itself.
+    if (kind === 'limited') return limitWords(true);
     if (kind === 'timeout') return 'The ticker search took too long and was stopped. Press Enter to try again.';
     return 'The ticker search did not answer. Press Enter to try again.';
   };
+  // The limit's line: the search's words, or the bare limit for what Enter
+  // asked (a typed code's check), as Backtester's picker says them.
+  const limitWords = (search) => {
+    const SC = window.SymbolCode;
+    const words = SC && SC.LIMIT_WORDS ? SC.LIMIT_WORDS : window.RateLimitWait.REACHED;
+    return search ? (SC && SC.SEARCH_LIMIT_WORDS) || 'The ticker search did not load: ' + words : words;
+  };
   const searchSeqRef = React.useRef(0);
   const [searchTry, setSearchTry] = React.useState(0);
-  // The limit stopped the search for this text: { failure, query }. Once
-  // the wait is over the search is asked again by itself for the text still
-  // in the field, paced as every panel's reload is (RateLimitWait). It
-  // waited for an Enter, and the list stayed empty after the wait.
+  // The limit stopped the search for this text: { failure, query, redo }.
+  // Once the wait is over the search is asked again by itself for the text
+  // still in the field, paced as every panel's reload is (RateLimitWait).
+  // It waited for an Enter, and the list stayed empty after the wait.
+  // `redo`: what was stopped when it was not the search -- Enter's check of
+  // a typed code -- done again instead.
   const [searchLimit, setSearchLimit] = React.useState(null);
-  const limitedSearch = (query) => setSearchLimit({ failure: Object.assign(window.RateLimitWait.failure({ rateLimited: true }), { status: 429 }), query });
-  window.RateLimitWait.useReloadAfterWait(searchLimit && searchLimit.failure, () => {
+  const limitedSearch = (query, redo) => setSearchLimit({ failure: Object.assign(window.RateLimitWait.failure({ rateLimited: true }), { status: 429 }), query, redo: redo || null });
+  // The panel's own wait: a press of its Try again or an Enter inside it
+  // sends nothing, and its note says so under the button -- not in the
+  // notice above, which is Refresh's.
+  const addWait = RLW.useWait();
+  const searchFieldRef = React.useRef(null);
+  // Once the wait is over, and on Try again after it.
+  const searchAgain = () => {
     const l = searchLimit;
-    if (!l || searchFailedRef.current !== 'limited' || searchNowRef.current !== l.query) { setSearchLimit(null); return; }
+    if (!l || searchNowRef.current !== l.query) { setSearchLimit(null); return; }
     // This screen's own hold outlasts the client's wait (a minute with no
     // Retry-After): looked at again later, nothing sent now.
-    if (Date.now() < searchLimitedUntilRef.current) { limitedSearch(l.query); return; }
+    if (Date.now() < searchLimitedUntilRef.current) { limitedSearch(l.query, l.redo); return; }
+    if (!l.redo && searchFailedRef.current !== 'limited') { setSearchLimit(null); return; }
+    // The line and its button leave: a focus on the button goes back to
+    // the field, as the picker's does.
+    const a = document.activeElement;
+    if (a && a.closest && a.closest('[data-search-wait]') && searchFieldRef.current) searchFieldRef.current.focus();
     setSearchLimit(null);
+    if (l.redo) { setAddNote(null); l.redo(); return; }
     setSearchTry((n) => n + 1);
-  }, 'search:sentiment');
+  };
+  window.RateLimitWait.useReloadAfterWait(searchLimit && searchLimit.failure, searchAgain, 'search:sentiment');
+  // Enter inside the wait on text whose search the limit stopped: nothing
+  // sent, and the note under Try again says so; the Enter is kept, and the
+  // search after the wait takes its row. It said nothing, and took nothing
+  // after.
+  const holdEnter = () => {
+    const q = searchNowRef.current;
+    addWait.hold();
+    pendingEnterRef.current = q;
+    setAddNote(searchFailNote('limited'));
+    if (!searchLimit || searchLimit.query !== q) limitedSearch(q);
+  };
   // Enter found nothing to add. Rows for other listings say so, by the
   // text typed.
   const noPickNote = (rows, query) => ((rows || []).length
@@ -542,6 +580,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   const takePick = (pick, query, rows) => {
     if (!pick) { setAddNote(noPickNote(rows, query)); return; }
     if (!pick.check) { addTicker(pick); setActiveResult(-1); return; }
+    // Inside the wait the check is not sent: said as a held press is, and
+    // made once the wait is over (as the picker's, 85).
+    const again = () => takePick(pick, query, rows);
+    if (addWait.hold()) { setAddNote(limitWords(false)); limitedSearch(query, again); return; }
     const SC = window.SymbolCode;
     const api = SC.apiFor(window.EODHD_API, apiKey);
     const gen = pickGenRef.current;
@@ -551,9 +593,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         const d = pick.check.lastIndexOf('.');
         addTicker((SC.listedRow && SC.listedRow(pick.check)) || { Code: pick.check.slice(0, d), Exchange: pick.check.slice(d + 1), Name: '' });
         setActiveResult(-1);
-      // The limit in this field's words: the wait is counted down in the
-      // notice above, and a number written here stood still.
-      } else if (ok === 'limited') setAddNote(searchFailNote('limited'));
+      // The limit in this field's words: the wait is counted down on the Try
+      // again under it, and a number written here stood still. The check is
+      // made again once the wait is over.
+      } else if (ok === 'limited') { setAddNote(limitWords(false)); limitedSearch(query, again); }
       // Nothing known (a 500, no connection): said as such, and Enter asks again.
       else if (ok && ok.failed !== undefined) setAddNote(SC.failNote(query, ok.failed, ok.unreadable));
       else setAddNote(SC.noneNote(query));
@@ -618,7 +661,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       const held = Date.now() < searchLimitedUntilRef.current ? 'limited' : (searchRefusedRef.current ? 'refused' : null);
       if (held) {
         if (inFlightRef.current === searchQuery) inFlightRef.current = null;
-        pendingEnterRef.current = null;
+        // An Enter kept for this text waits for the search after the wait
+        // and takes its row then.
+        if (held !== 'limited') pendingEnterRef.current = null;
         searchFailedRef.current = held;
         resultsQueryRef.current = searchQuery;
         resultsRowsRef.current = [];
@@ -673,7 +718,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         searchFailedRef.current = kind;
         resultsQueryRef.current = searchQuery;
         resultsRowsRef.current = [];
-        pendingEnterRef.current = null;
+        // At the limit an Enter kept for this text is kept for the search
+        // after the wait, as above.
+        if (kind !== 'limited') pendingEnterRef.current = null;
         setAddNote(searchFailNote(kind));
         if (kind === 'limited') limitedSearch(searchQuery); else setSearchLimit(null);
         setSearchResults([]);
@@ -1352,6 +1399,22 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         {/* Always there, so a reader hears a line when it appears. */}
         <div role="status" aria-live="polite" data-sent-add-note={addNote ? 'true' : undefined}
              style={addNote ? { fontSize: 11, marginBottom: 8, color: isDark ? C3.textMutedDark : C3.textMutedLight, overflowWrap: 'anywhere' } : undefined}>{addNote || ''}</div>
+        {/* At the limit, as the shared picker draws it (PortalDropdown,
+            RetryAfterWait): Try again counting the wait down, outside the
+            line's live region, and the note of an Enter or a press it held.
+            There was neither. */}
+        {showSearch && searchLimit && addNote && (
+          <div data-search-wait="true" style={{ marginBottom: 8 }}>
+            <RLW.RetryButton wait={addWait} noteHere={false} isDark={isDark} data-retry-focus="true" onClick={searchAgain} style={{
+              padding: '4px 12px', minHeight: 32, borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 600,
+              background: 'none', border: '1px solid ' + (isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.25)'),
+              color: isDark ? C3.textDark : C3.textLightTheme,
+            }} />
+            {addWait.note && (
+              <span data-rl-note="true" style={{ display: 'block', marginTop: 6, fontSize: 12, fontWeight: 400, lineHeight: 1.4, color: isDark ? C3.textDark : C3.textLightTheme }}>{addWait.note}</span>
+            )}
+          </div>
+        )}
         {storeNote && (
           <div role="status" data-sent-store-note="" style={{ fontSize: 11, marginBottom: 8, color: isDark ? C3.textDark : C3.textLightTheme }}>{storeNote}</div>
         )}
@@ -1369,6 +1432,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                 Enter takes the highlighted row -- or the only one, when the
                 list has settled on a single match. */}
             <input {...window.TickerFieldProps}
+              ref={searchFieldRef}
               data-field-snug=""
               type="text"
               value={searchQuery}
@@ -1378,6 +1442,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                 // Inside a 429's wait or after a refusal the search for the
                 // new text says it again.
                 setAddNote(null);
+                // The check an Enter asked for is that Enter's: once the text
+                // is edited it is not made after the wait, even for the same
+                // text typed again (F → V → F added F with no Enter). The search for the text still is.
+                setSearchLimit((l) => (l && l.redo ? Object.assign({}, l, { redo: null }) : l));
               }}
               data-esc-own="true"
               onKeyDown={(e) => {
@@ -1422,7 +1490,8 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                       // Asked again only where that can help: not after a
                       // refusal, and not inside a 429's wait.
                       const kind = searchFailedRef.current;
-                      if (kind === 'refused' || (kind === 'limited' && Date.now() < searchLimitedUntilRef.current)) {
+                      if (kind === 'limited' && Date.now() < searchLimitedUntilRef.current) { holdEnter(); return; }
+                      if (kind === 'refused') {
                         setAddNote(searchFailNote(kind));
                         return;
                       }
@@ -1433,7 +1502,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                     } else setAddNote(noPickNote(resultsRowsRef.current, searchQuery));
                     return;
                   }
-                  // The list for what is typed has not arrived yet.
+                  // The list for what is typed has not arrived yet (inside
+                  // the wait its search is not sent: addWait says so).
+                  addWait.hold();
                   pendingEnterRef.current = searchQuery;
                   return;
                 }
