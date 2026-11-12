@@ -480,6 +480,21 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   };
   const searchSeqRef = React.useRef(0);
   const [searchTry, setSearchTry] = React.useState(0);
+  // The limit stopped the search for this text: { failure, query }. Once
+  // the wait is over the search is asked again by itself for the text still
+  // in the field, paced as every panel's reload is (RateLimitWait). It
+  // waited for an Enter, and the list stayed empty after the wait.
+  const [searchLimit, setSearchLimit] = React.useState(null);
+  const limitedSearch = (query) => setSearchLimit({ failure: Object.assign(window.RateLimitWait.failure({ rateLimited: true }), { status: 429 }), query });
+  window.RateLimitWait.useReloadAfterWait(searchLimit && searchLimit.failure, () => {
+    const l = searchLimit;
+    if (!l || searchFailedRef.current !== 'limited' || searchNowRef.current !== l.query) { setSearchLimit(null); return; }
+    // This screen's own hold outlasts the client's wait (a minute with no
+    // Retry-After): looked at again later, nothing sent now.
+    if (Date.now() < searchLimitedUntilRef.current) { limitedSearch(l.query); return; }
+    setSearchLimit(null);
+    setSearchTry((n) => n + 1);
+  }, 'search:sentiment');
   // Enter found nothing to add. Rows for other listings say so, by the
   // text typed.
   const noPickNote = (rows, query) => ((rows || []).length
@@ -521,7 +536,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         const d = pick.check.lastIndexOf('.');
         addTicker((SC.listedRow && SC.listedRow(pick.check)) || { Code: pick.check.slice(0, d), Exchange: pick.check.slice(d + 1), Name: '' });
         setActiveResult(-1);
-      } else if (ok === 'limited') setAddNote(SC.limitNote(api.limited()));
+      // The limit in this field's words: the wait is counted down in the
+      // notice above, and a number written here stood still.
+      } else if (ok === 'limited') setAddNote(searchFailNote('limited'));
       // Nothing known (a 500, no connection): said as such, and Enter asks again.
       else if (ok && ok.failed !== undefined) setAddNote(SC.failNote(query, ok.failed, ok.unreadable));
       else setAddNote(SC.noneNote(query));
@@ -592,6 +609,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         resultsRowsRef.current = [];
         setSearchResults([]);
         setAddNote(searchFailNote(held));
+        if (held === 'limited') limitedSearch(searchQuery);
         return;
       }
       setSearchLoading(true);
@@ -613,6 +631,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         // The search answered: what the field said about an earlier failure
         // ("Too many requests at once", "took too long") is no longer true.
         setAddNote(null);
+        setSearchLimit(null);
         const shown = (data || []).slice(0, 8);
         resultsRowsRef.current = shown;
         if (pendingEnterRef.current === searchQuery) {
@@ -641,6 +660,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         resultsRowsRef.current = [];
         pendingEnterRef.current = null;
         setAddNote(searchFailNote(kind));
+        if (kind === 'limited') limitedSearch(searchQuery); else setSearchLimit(null);
         setSearchResults([]);
       }
       setSearchLoading(false);

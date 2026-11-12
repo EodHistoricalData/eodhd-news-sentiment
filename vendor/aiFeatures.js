@@ -3,14 +3,15 @@
 // AIFeatureButton — gradient button with token cost badge
 // `feature`: the token key it is charged as; the label then says the price
 // ("Get AI Verdict · 3 tokens"). What-If passed it and nothing showed it.
-window.AIFeatureButton = ({ label, icon, tokenCost, onClick, loading, isDark, style, feature }) => {
+// `disabled`: not available here; without it the button is as it always was.
+window.AIFeatureButton = ({ label, icon, tokenCost, onClick, loading, isDark, style, feature, disabled }) => {
   const C3 = window.C3;
   const useFeatureCost = (() => null);
   const cost = useFeatureCost(feature || null);
   return (
     <button
       onClick={(e) => { e.stopPropagation(); window.Haptics?.medium(); onClick?.(); }}
-      disabled={loading}
+      disabled={loading || disabled}
       style={{
         display: 'inline-flex', alignItems: 'center', gap: 8,
         padding: '10px 18px',
@@ -18,8 +19,8 @@ window.AIFeatureButton = ({ label, icon, tokenCost, onClick, loading, isDark, st
         background: loading ? (isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)') : C3.logoGradient,
         border: 'none', color: 'white',
         fontSize: 13, fontWeight: 600,
-        cursor: loading ? 'wait' : 'pointer',
-        opacity: loading ? 0.7 : 1,
+        cursor: loading ? 'wait' : disabled ? 'not-allowed' : 'pointer',
+        opacity: loading ? 0.7 : disabled ? 0.5 : 1,
         position: 'relative',
         ...style,
       }}
