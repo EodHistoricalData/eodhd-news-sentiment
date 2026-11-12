@@ -64,22 +64,37 @@ window.SentimentCache = (function () {
 window.SentimentNotFound = (e) => Boolean(e && (Number(e.status) === 404 || Number(e.upstreamStatus) === 404));
 window.SentimentAskSplit = async (list, ask) => {
   const unwrap = (raw) => ((raw && typeof raw === 'object' && !Array.isArray(raw) && raw.data && typeof raw.data === 'object') ? raw.data : raw);
+  // The words a body may carry beside its data, as the shared notData has
+  // them (RateLimitWait): a body of nothing else is no data; beside
+  // readings they are not readings.
+  const NOTE_KEYS = { message: 1, status: 1, statusCode: 1, success: 1, detail: 1 };
   const into = (out, raw, one) => {
     const data = unwrap(raw);
     if (Array.isArray(data) && one) out[one] = data;
-    else if (data && typeof data === 'object' && !Array.isArray(data)) Object.assign(out, data);
+    else if (data && typeof data === 'object' && !Array.isArray(data)) {
+      Object.keys(data).forEach((k) => { if (NOTE_KEYS[k] !== 1) out[k] = data[k]; });
+    }
   };
   // An answer is readings keyed by symbol (or one symbol's list). Anything
   // else that came back with 200 -- {"message": ...}, a string -- could not
   // be read: it is a failure, never an empty reading. Read as "answered",
   // {"message"} wiped the readings on screen and put [] into the cache for
-  // every ticker.
+  // every ticker. Readings with a
+  // "message" beside them are still an answer, as the shared notData reads
+  // them: every key had to be a list, and they read "could not read".
   const readable = (raw, one) => {
     if (raw && typeof raw === 'object' && !Array.isArray(raw) && raw.error) return true;
+    const RLW = window.RateLimitWait;
+    const noData = (b) => Boolean(RLW && RLW.notData && RLW.notData(b));
+    if (noData(raw)) return false;
     const data = unwrap(raw);
     if (Array.isArray(data)) return Boolean(one);
-    if (!data || typeof data !== 'object') return false;
-    return Object.keys(data).every((k) => data[k] == null || Array.isArray(data[k]));
+    if (!data || typeof data !== 'object' || noData(data)) return false;
+    const keys = Object.keys(data);
+    const symbols = keys.filter((k) => NOTE_KEYS[k] !== 1);
+    // Only notes and no reading: not data. Nothing at all: an empty answer.
+    if (!symbols.length) return keys.length === 0;
+    return symbols.every((k) => data[k] == null || Array.isArray(data[k]));
   };
   const notRead = () => {
     const RLW = window.RateLimitWait;
