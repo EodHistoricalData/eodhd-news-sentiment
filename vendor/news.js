@@ -281,6 +281,13 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
     if (forceRefresh) setRefreshFail(null);
 
     const cached = Cache.getCategoryCache(category);
+    // Headlines already on screen (this feed's, or a cache): a failure is
+    // said beside them ("The refresh did not load…"), so the open apps'
+    // shell keeps it out of its panel above, which said it a second time
+    // (reportsFailure). A first load leaves the failure
+    // to the panel, as before. The terminal's client ignores the option.
+    const ownsFailure = servedRef.current === feedKey || Boolean(cached && cached.items && cached.items.length);
+    const newsOpts = (more) => ({ ...more, throwErrors: true, ...(ownsFailure ? { reportsFailure: true } : {}) });
 
     if (cached && cached.items && !forceRefresh) {
       setNews(cached.items);
@@ -311,7 +318,7 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
             // Full CODE.EXCHANGE — s=AIR is AAR Corp, s=AIR.PA is Airbus.
             // An answer that is not a list could not be read, as on the
             // main feed.
-            window.EODHD_API.getNews(apiKey, ticker, 5, { throwErrors: true })
+            window.EODHD_API.getNews(apiKey, ticker, 5, newsOpts())
               .then((d) => (d == null || Array.isArray(d) ? d : Promise.reject(Object.assign(new Error(NOT_SERVED), { unreadable: true, status: 200 }))))
               .catch((e) => { firstErr = firstErr || e; return null; })
           )
@@ -337,7 +344,7 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
       } else {
         const opts = {};
         if (selectedCategory?.tag) opts.t = selectedCategory.tag;
-        const data = await window.EODHD_API.getNews(apiKey, null, 50, { ...opts, throwErrors: true });
+        const data = await window.EODHD_API.getNews(apiKey, null, 50, newsOpts(opts));
         if (!sameFeed()) return;
         // An answer that is not a list could not be read: said as that, not
         // as no answer.

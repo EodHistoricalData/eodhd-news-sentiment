@@ -902,7 +902,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         // throwErrors: a failed request is "could not load", not "no news" --
         // the terminal's getNews answered [] on a 500 and the page read "No
         // recent news found" (the open apps' shell already said failed).
-        const news = await window.EODHD_API.getNews(apiKey, selectedTicker, 30, { throwErrors: true });
+        // reportsFailure: that line, with its Try again, is this failure's
+        // message; the open apps' shell keeps it out of its panel above, which
+        // said it a second time. The terminal ignores it.
+        const news = await window.EODHD_API.getNews(apiKey, selectedTicker, 30, { throwErrors: true, reportsFailure: true });
         if (cancelled) return;
         // Not a list is a failure, not an empty list: a timed-out request
         // used to read "No recent news found for AAPL" under a donut of

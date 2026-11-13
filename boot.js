@@ -11,6 +11,9 @@ window.APP_META = {
   "storage": [
     "eodhd_news_",
     "eodhd_sentiment_tickers"
+  ],
+  "ownFailures": [
+    "searchStocks"
   ]
 };
 
