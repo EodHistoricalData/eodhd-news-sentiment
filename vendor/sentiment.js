@@ -417,6 +417,8 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     resultsRowsRef.current = [];
     setSearchLoading(false);
     setAddNote(null);
+    setDownFor(null);
+    endRetryBusy(false);
     // And what the limit stopped: a code Enter asked for before the panel
     // was closed was checked and added by itself once the wait was over,
     // the panel shut or open on another text.
@@ -537,6 +539,34 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     setSearchTry((n) => n + 1);
   };
   window.RateLimitWait.useReloadAfterWait(searchLimit && searchLimit.failure, searchAgain, 'search:sentiment');
+  // The search did not answer (EODHD's error, no connection, past its time):
+  // the text it was for. A Try again under the line asks it again, as Enter
+  // does, and reads "Loading…" while it is out; the line stays until it
+  // answers. Every other ticker picker has one.
+  const [downFor, setDownFor] = React.useState(null);
+  const RETRY_KEY = 'search:sentiment-retry';
+  const retryBusyRef = React.useRef(null);
+  const retrySearch = () => {
+    const q = searchNowRef.current;
+    if (retryBusyRef.current || downFor !== q) return;
+    retryBusyRef.current = RLW.setBusy(RETRY_KEY, 'retry');
+    inFlightRef.current = q;
+    setSearchTry((n) => n + 1);
+  };
+  // Over when the search it asked is: answered, failed, held, or ended by
+  // typing or closing -- called there, not read from a render, where an
+  // answer in the same batch as "loading" left it "Loading…" for good.
+  // Answered: the line and the button leave, and the focus
+  // on the button goes back to the field.
+  const endRetryBusy = (answered) => {
+    const token = retryBusyRef.current;
+    if (!token) return;
+    retryBusyRef.current = null;
+    RLW.endBusy(RETRY_KEY, token);
+    const a = document.activeElement;
+    if (answered && a && a.closest && a.closest('[data-search-retry]') && searchFieldRef.current) searchFieldRef.current.focus();
+  };
+  React.useEffect(() => () => { if (retryBusyRef.current) RLW.endBusy(RETRY_KEY, retryBusyRef.current); }, []);
   // Enter inside the wait on text whose search the limit stopped: nothing
   // sent, and the note under Try again says so; the Enter is kept, and the
   // search after the wait takes its row. It said nothing, and took nothing
@@ -550,9 +580,16 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   };
   // Enter found nothing to add. Rows for other listings say so, by the
   // text typed.
-  const noPickNote = (rows, query) => ((rows || []).length
-    ? 'No listing found for ' + String(query).trim()
-    : 'No ticker matches "' + query + '"');
+  // A bare code the search lists only on other exchanges names them, to be
+  // picked from the list below: "MSF" added MSF.XETRA as a card "MSF × no
+  // data" (SymbolCode.elsewhere).
+  const noPickNote = (rows, query) => {
+    const away = window.SymbolCode.elsewhere(rows, query);
+    if (away) return away.note;
+    return (rows || []).length
+      ? 'No listing found for ' + String(query).trim()
+      : 'No ticker matches "' + query + '"';
+  };
   // The row Enter adds, by the shared reader (window.SymbolCode.bestRow). A
   // code typed with its exchange, class or "^" is that listing, as the link
   // reads it: "BRK.B" added BRK.TO, "^GSPC" GSPCX.US and "GSPC.INDX" nothing.
@@ -669,38 +706,51 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         resultsRowsRef.current = [];
         setSearchResults([]);
         setAddNote(searchFailNote(held));
+        setDownFor(null);
+        endRetryBusy(false);
         if (held === 'limited') limitedSearch(searchQuery);
         return;
       }
       setSearchLoading(true);
-      try {
-        // Capped: a search that hangs is told as one after ANSWER_MS, and
-        // Enter can ask again. The answer arriving after the
-        // cap is dropped.
-        let waitTid = null;
-        // The code alone for Yahoo's suffix: search/VOD.L answers nothing,
-        // search/VOD answers VOD.LSE (window.SymbolCode.searchText).
-        const ask = window.EODHD_API.searchStocks(apiKey, window.SymbolCode.searchText(searchQuery) || searchQuery, { throwErrors: true });
-        Promise.resolve(ask).catch(() => {});
-        const data = await Promise.race([ask, new Promise((_, fail) => {
-          waitTid = setTimeout(() => fail(Object.assign(new Error('The ticker search took too long'), { timedOut: true })), window.SentimentSearchWait.ANSWER_MS);
-        })]).finally(() => { clearTimeout(waitTid); if (latest() && inFlightRef.current === searchQuery) inFlightRef.current = null; });
-        if (!latest()) return;
+      // The search answered: what the field said about an earlier failure
+      // ("Too many requests at once", "took too long") is no longer true.
+      // False when an Enter waiting for it added its row.
+      const answered = (data) => {
         searchFailedRef.current = false;
         resultsQueryRef.current = searchQuery;
-        // The search answered: what the field said about an earlier failure
-        // ("Too many requests at once", "took too long") is no longer true.
         setAddNote(null);
         setSearchLimit(null);
+        setDownFor(null);
+        endRetryBusy(true);
         const shown = (data || []).slice(0, 8);
         resultsRowsRef.current = shown;
         if (pendingEnterRef.current === searchQuery) {
           pendingEnterRef.current = null;
           const pick = bestMatch(shown, searchQuery);
-          if (pick && !pick.check) { setSearchLoading(false); addTicker(pick); setActiveResult(-1); return; }
+          if (pick && !pick.check) { setSearchLoading(false); addTicker(pick); setActiveResult(-1); return false; }
           takePick(pick, searchQuery, shown);
         }
         setSearchResults(data || []);
+        return true;
+      };
+      try {
+        // Capped: a search that hangs is told as one after ANSWER_MS, and
+        // Enter can ask again. The answer arriving after the
+        // cap is dropped: "stopped" has been said (accepted; CI on r24). The
+        // time counts from when the request is sent: inside a 429's wait the
+        // Mini App's client holds it and asks again after
+        // (SymbolCode.searchDeadline).
+        let stopWait = null;
+        // The code alone for Yahoo's suffix: search/VOD.L answers nothing,
+        // search/VOD answers VOD.LSE (window.SymbolCode.searchText).
+        const ask = window.EODHD_API.searchStocks(apiKey, window.SymbolCode.searchText(searchQuery) || searchQuery, { throwErrors: true });
+        Promise.resolve(ask).catch(() => {});
+        const data = await Promise.race([ask, new Promise((_, fail) => {
+          stopWait = window.SymbolCode.searchDeadline(window.SentimentSearchWait.ANSWER_MS,
+            () => fail(Object.assign(new Error('The ticker search took too long'), { timedOut: true })), window.EODHD_API);
+        })]).finally(() => { if (stopWait) stopWait(); if (latest() && inFlightRef.current === searchQuery) inFlightRef.current = null; });
+        if (!latest()) return;
+        if (!answered(data)) return;
       } catch (e) {
         // The search did not answer. "No ticker matches" said there was no
         // such ticker, next to the open app's "EODHD did not answer".
@@ -722,6 +772,8 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         // after the wait, as above.
         if (kind !== 'limited') pendingEnterRef.current = null;
         setAddNote(searchFailNote(kind));
+        setDownFor(kind === 'down' || kind === 'timeout' ? searchQuery : null);
+        endRetryBusy(false);
         if (kind === 'limited') limitedSearch(searchQuery); else setSearchLimit(null);
         setSearchResults([]);
       }
@@ -1418,6 +1470,16 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
             )}
           </div>
         )}
+        {/* The search did not answer: Try again asks it again (downFor). */}
+        {showSearch && !searchLimit && addNote && downFor != null && downFor === searchQuery && (
+          <div data-search-retry="true" style={{ marginBottom: 8 }}>
+            <RLW.RetryButton isDark={isDark} busyKey={RETRY_KEY} data-retry-focus="true" onClick={retrySearch} style={{
+              padding: '4px 12px', minHeight: 32, borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 600,
+              background: 'none', border: '1px solid ' + (isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.25)'),
+              color: isDark ? C3.textDark : C3.textLightTheme,
+            }} />
+          </div>
+        )}
         {storeNote && (
           <div role="status" data-sent-store-note="" style={{ fontSize: 11, marginBottom: 8, color: isDark ? C3.textDark : C3.textLightTheme }}>{storeNote}</div>
         )}
@@ -1445,6 +1507,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                 // Inside a 429's wait or after a refusal the search for the
                 // new text says it again.
                 setAddNote(null);
+                endRetryBusy(false);
                 // The check an Enter asked for is that Enter's: once the text
                 // is edited it is not made after the wait, even for the same
                 // text typed again (F → V → F added F with no Enter). The search for the text still is.

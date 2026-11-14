@@ -13,8 +13,23 @@ window.APP_META = {
     "eodhd_sentiment_tickers"
   ],
   "ownFailures": [
-    "searchStocks"
-  ]
+    "searchStocks",
+    "getRealTimeData"
+  ],
+  "ownLines": {
+    "searchStocks": [
+      "[data-sent-add-note]",
+      "~ticker search (did not|took too long|was refused)"
+    ],
+    "getRealTimeData": [
+      "[data-sent-add-note]~Could not check",
+      "~Could not check"
+    ],
+    "getNews": [
+      "[data-rl-fail]~refresh did not load",
+      "~Could not load news for"
+    ]
+  }
 };
 
 if (!window.React || !window.ReactDOM) {
