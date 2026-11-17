@@ -185,7 +185,7 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
   // Not a live region: the note counts every second; the press was said
   // once when it was held, by RateLimitWait.
   const waitNoteEl = rlWait.note
-    ? <p data-wait-note="true" style={{ margin: '12px 0 0', fontSize: 13, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p> : null;
+    ? <p data-wait-note="true" data-own-fail="news" style={{ margin: '12px 0 0', fontSize: 13, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p> : null;
   // A retry of a failed panel -- a press, or the reload after the wait --
   // takes the focus back where it was (the Try again if the failure is
   // back, else the heading) only when the focus was on that panel: the
@@ -253,7 +253,10 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
   // A failure that was the limit stays the limit when the wait is over: the
   // line turned into "did not answer" on the second the wait ended, and was
   // announced, so the end of a pause was said twice.
+  // A refused key or a spent day under the open apps' panel: the line says
+  // only that the feed did not load and points to it.
   const notServedText = (f) => (f && f.limited ? NOT_SERVED_LIMIT
+    : RLW.hostSaysKey(f) ? RLW.panelLine('The news feed')
     : f && (f.status || f.unreadable)
       ? 'The news feed did not load: ' + window.RateLimitWait.failReason(f) + ' Nothing is listed — that is not the same as no news.'
       : NOT_SERVED);
@@ -325,10 +328,18 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
         );
         if (!sameFeed()) return;
         // Every ticker refused or failed: nothing was served. The first
-        // refusal's status goes with it, so the reason can be named.
+        // refusal's status goes with it, so the reason can be named -- as
+        // RateLimitWait reads it: the Mini App's own key asks EODHD through
+        // its client, whose errors carry statusCode, and 401, 402, 403 and
+        // 500 all read "did not answer".
         if (results.every(x => !Array.isArray(x))) {
           const e = new Error(NOT_SERVED);
-          if (firstErr) { e.status = firstErr.status; e.upstreamStatus = firstErr.upstreamStatus; e.rateLimited = firstErr.rateLimited; e.unreadable = firstErr.unreadable; }
+          if (firstErr) {
+            const f = RLW.failure(firstErr);
+            e.status = f.status;
+            e.rateLimited = f.limited;
+            e.unreadable = f.unreadable;
+          }
           throw e;
         }
         const allNews = results.filter(Array.isArray).flat().filter(Boolean);
@@ -719,21 +730,29 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
                 <Icon name="alert" size={64} color={isDark ? C3.textMutedDark : C3.textMutedLight} />
                 {/* Read out when it appears, as the other screens' failures
                     are. */}
-                <p role="status" style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginTop: '16px' }}>{error === NOT_SERVED ? (newsLimited ? NOT_SERVED_LIMIT : notServedText(errorFail)) : error}</p>
-                <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onClick={() => { retryFocusRef.current = true; loadNews(); }} style={{
-                  marginTop: '16px', color: C3.glowOrange, background: 'transparent',
-                  border: 'none', cursor: 'pointer', fontWeight: '600',
-                }} />
+                <p role="status" data-own-fail="news" data-see-panel={error === NOT_SERVED && !newsLimited && RLW.hostSaysKey(errorFail) ? 'true' : undefined} style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginTop: '16px' }}>{error === NOT_SERVED ? (newsLimited ? NOT_SERVED_LIMIT : notServedText(errorFail)) : error}</p>
+                {/* No Try again for a plan's refusal (403), nor
+                    under a host's panel for the key or the day. */}
+                {!(error === NOT_SERVED && !newsLimited && errorFail && !errorFail.limited && (errorFail.status === 403 || RLW.hostSaysKey(errorFail))) && (
+                  <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onClick={() => { retryFocusRef.current = true; loadNews(); }} style={{
+                    marginTop: '16px', color: C3.glowOrange, background: 'transparent',
+                    border: 'none', cursor: 'pointer', fontWeight: '600',
+                  }} />
+                )}
                 {waitNoteEl}
               </div>
             )}
 
-            {refused && !loading && !(news && news.length) && (
+            {/* Not beside the failure's own line above: two messages and two
+                Try agains for one failure. */}
+            {refused && !error && !loading && !(news && news.length) && (
               <div data-news-fail="true" style={{ textAlign: 'center', padding: '32px 20px' }}>
                 {/* The words are the live region; the button counts the wait
                     every second and stays outside it. */}
-                <p role="status" style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px' }}>
-                  Nothing below is missing data — the request was not served. See the panel above.
+                {/* What did not load, pointing to the panel: "Nothing below is
+                    missing data" is the panel's sentence. */}
+                <p role="status" data-own-fail="news" data-see-panel="true" style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px' }}>
+                  {RLW.panelLine('The news')}
                 </p>
                 <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onClick={() => { retryFocusRef.current = true; loadNews(true); }} style={{
                   padding: '12px 24px', background: C3.logoGradient, border: 'none',
@@ -747,7 +766,7 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
                 with Try again (counting the limit's wait down; at the limit
                 the feed is asked again by itself once the wait is over). */}
             {refreshFail && !loading && !error && news && news.length > 0 && (
-              <RLW.FailNote panel="news-refresh" failure={refreshFail} ownFocus data-retry-focus="true" onRetry={() => { keepRetryFocus(); loadNews(true); }} isDark={isDark}
+              <RLW.FailNote panel="news-refresh" ownFail="news" failure={refreshFail} ownFocus data-retry-focus="true" onRetry={() => { keepRetryFocus(); loadNews(true); }} isDark={isDark}
                 text={'The refresh did not load: ' + RLW.failReason(refreshFail)} extra="The headlines shown are the last ones loaded."
                 style={{ fontSize: 13, margin: '0 0 12px' }} />
             )}

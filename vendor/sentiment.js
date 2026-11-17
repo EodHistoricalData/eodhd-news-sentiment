@@ -47,6 +47,13 @@ window.SentimentCache = (function () {
       const hit = forKey(apiKey)[ticker];
       return Boolean(hit && hit.missing && (now || Date.now()) - hit.at < TTL);
     },
+    // The endpoint refuses the symbol (400 on `s`): kept, so the next load
+    // does not send it in the list again.
+    putUnavailable(apiKey, ticker, now) { forKey(apiKey)[ticker] = { items: [], unavailable: true, at: now || Date.now() }; },
+    unavailable(apiKey, ticker, now) {
+      const hit = forKey(apiKey)[ticker];
+      return Boolean(hit && hit.unavailable && (now || Date.now()) - hit.at < TTL);
+    },
     clear() { store = {}; owner = null; },
     TTL,
   };
@@ -62,7 +69,78 @@ window.SentimentCache = (function () {
 //   -> { data: { SYMBOL: [...] }, missing: [symbols EODHD does not know],
 //        failed: [symbols whose own request failed otherwise] }
 window.SentimentNotFound = (e) => Boolean(e && (Number(e.status) === 404 || Number(e.upstreamStatus) === 404));
+// A list refused as a whole for its symbols: 400 {"error":
+// "invalid_parameter", "parameter": "s"} for AAPL.US,MSFT.US,NVDA.US,M&M.NSE
+// drew "did not load" on every card and an empty gauge, and the saved list
+// kept the screen so after a reload. A 400 that
+// names no parameter is read the same; one about another parameter is not.
+window.SentimentListRefused = (e) => Boolean(e && Number(e.status) === 400 && (!e.parameter || e.parameter === 's'));
+// What a symbol in such a list may be made of. One with anything else ("&")
+// is the first suspect, and is not added at + Add.
+window.SentimentSymbolOk = (t) => /^[A-Za-z0-9._-]+$/.test(String(t || ''));
+// What a card of such a ticker says, and the line under + Add.
+window.SentimentUnavailableNote = (t) => `Sentiment data is not available for ${t}.`;
+// The list refused as a whole is asked again without its suspects, then by
+// halves, until the symbols the endpoint refuses are found (`unavailable`) and
+// every other one is read as usual. A part that went through whole puts the
+// refusal in the other part, which is not asked again when it is one symbol:
+// AAPL, MSFT, NVDA, M&M is two requests.
+// A part that fails otherwise once the list is split (a 500, the limit, a
+// drop) is that part's failure: its symbols are `failed`, each with its
+// reason in `failures`, and what the other parts read stays. It escaped the
+// split: [A, B, BAD, C] with C at 500 threw A and B away and marked the whole
+// list failed. The list itself failing otherwise
+// is thrown, as before.
 window.SentimentAskSplit = async (list, ask) => {
+  const settle = async (part, refusedWhole, split) => {
+    if (!refusedWhole) {
+      try { return Object.assign({ unavailable: [] }, await window.SentimentAskEach(part, ask)); } catch (e) {
+        if (!window.SentimentListRefused(e)) {
+          if (!split) throw e;
+          const failures = {};
+          part.forEach((t) => { failures[t] = e; });
+          return { data: {}, missing: [], unavailable: [], answered: false, partial: true, failed: part.slice(), failure: e, failures };
+        }
+      }
+    }
+    if (part.length === 1) return { data: {}, missing: [], unavailable: part.slice(), answered: true };
+    const odd = part.filter((t) => !window.SentimentSymbolOk(t));
+    const half = Math.ceil(part.length / 2);
+    const first = odd.length && odd.length < part.length ? part.filter((t) => window.SentimentSymbolOk(t)) : part.slice(0, half);
+    const second = part.filter((t) => first.indexOf(t) === -1);
+    const a = await settle(first, false, true);
+    // The refusal is the other part's only when this one was read whole: an
+    // outage here (a 500, the limit, a drop) proves nothing about it. [BAD,
+    // GOOD] refused, BAD then at 500: GOOD was taken as the refused half,
+    // never asked, and kept as "not available" for ten minutes. Left unclassified instead: failed with that
+    // outage, its card "did not load" with Try again.
+    const outage = Boolean(a.failed && a.failed.length) && a.unavailable.length === 0;
+    if (outage) {
+      const failures = {};
+      second.forEach((t) => { failures[t] = a.failure; });
+      const b = { data: {}, missing: [], unavailable: [], answered: false, partial: true, failed: second.slice(), failure: a.failure, failures };
+      return {
+        data: a.data, missing: a.missing, unavailable: [], answered: false, error: a.error, partial: true,
+        failed: a.failed.concat(b.failed), failure: a.failure, failures: Object.assign({}, a.failures || {}, failures),
+      };
+    }
+    const b = await settle(second, a.unavailable.length === 0, true);
+    return {
+      data: Object.assign({}, a.data, b.data),
+      missing: a.missing.concat(b.missing),
+      unavailable: a.unavailable.concat(b.unavailable),
+      answered: Boolean(a.answered && b.answered),
+      error: a.error || b.error,
+      partial: Boolean(a.partial || b.partial),
+      failed: (a.failed || []).concat(b.failed || []),
+      failure: a.failure || b.failure || null,
+      failures: Object.assign({}, a.failures || {}, b.failures || {}),
+    };
+  };
+  return settle(list, false, false);
+};
+// One list as the endpoint answers it, with the 404 split above.
+window.SentimentAskEach = async (list, ask) => {
   const unwrap = (raw) => ((raw && typeof raw === 'object' && !Array.isArray(raw) && raw.data && typeof raw.data === 'object') ? raw.data : raw);
   // The words a body may carry beside its data, as the shared notData has
   // them (RateLimitWait): a body of nothing else is no data; beside
@@ -113,10 +191,13 @@ window.SentimentAskSplit = async (list, ask) => {
     const out = {};
     const missing = [];
     const failedList = [];
+    // A symbol refused on its own here is not available, as above.
+    const unavailable = [];
+    const failures = {};
     let failed = null;
     const parts = await Promise.all(list.map((t) => Promise.resolve().then(() => ask([t])).then((raw) => ({ t, raw }), (err) => ({ t, err }))));
     parts.forEach((p) => {
-      if (p.err) { if (window.SentimentNotFound(p.err)) missing.push(p.t); else { failed = failed || p.err; failedList.push(p.t); } return; }
+      if (p.err) { if (window.SentimentNotFound(p.err)) missing.push(p.t); else if (window.SentimentListRefused(p.err)) unavailable.push(p.t); else { failed = failed || p.err; failedList.push(p.t); failures[p.t] = p.err; } return; }
       // An error envelope sent with 200 is a failure for that symbol: not
       // remembered as "no data".
       if (p.raw && typeof p.raw === 'object' && !Array.isArray(p.raw) && p.raw.error) { failed = failed || new Error(String(p.raw.error)); failedList.push(p.t); return; }
@@ -124,8 +205,8 @@ window.SentimentAskSplit = async (list, ask) => {
       into(out, p.raw, p.t);
     });
     // Every one of them failed for another reason: that is the answer.
-    if (failed && !Object.keys(out).length && !missing.length) throw failed;
-    return { data: out, missing, answered: true, partial: Boolean(failed), failed: failedList, failure: failed };
+    if (failed && !Object.keys(out).length && !missing.length && !unavailable.length) throw failed;
+    return { data: out, missing, unavailable, answered: true, partial: Boolean(failed), failed: failedList, failure: failed, failures };
   }
 };
 
@@ -188,6 +269,7 @@ window.SentimentSearchWait = { ANSWER_MS: 9000, LIMIT_MS: 60000 };
 // `status` ({ failed, unknown }: tickers) names the ones that did not load
 // and the ones EODHD does not know: "(no data for the rest)" read as an
 // answer for a symbol whose request had failed.
+// `status.unavailable`: the ones the endpoint refuses.
 window.SentimentAggregateLine = (tracked, data, score, status) => {
   const n = (tracked || []).length;
   const word = (k) => `${k} tracked ticker${k === 1 ? '' : 's'}`;
@@ -199,18 +281,23 @@ window.SentimentAggregateLine = (tracked, data, score, status) => {
   const names = (list) => list.map((t) => window.SentimentTickerLabel(t, tracked)).join(', ');
   const failed = mine(status && status.failed);
   const unknown = mine(status && status.unknown).filter((t) => failed.indexOf(t) === -1);
-  if (!failed.length && !unknown.length) return `Aggregated from ${used} of ${word(n)} (no data for the rest), weighted by mentions`;
+  const unavailable = mine(status && status.unavailable).filter((t) => failed.indexOf(t) === -1 && unknown.indexOf(t) === -1);
+  if (!failed.length && !unknown.length && !unavailable.length) return `Aggregated from ${used} of ${word(n)} (no data for the rest), weighted by mentions`;
   const notes = [];
   if (failed.length) notes.push(`${names(failed)} did not load`);
   if (unknown.length) notes.push(`not found on EODHD: ${names(unknown)}`);
-  if (n - used - failed.length - unknown.length > 0) notes.push('no data for the rest');
+  if (unavailable.length) notes.push(`not available for ${names(unavailable)}`);
+  if (n - used - failed.length - unknown.length - unavailable.length > 0) notes.push('no data for the rest');
   return `Aggregated from ${used} of ${word(n)}, weighted by mentions (${notes.join('; ')})`;
 };
 
 // What a Refresh that failed says next to the readings it kept: it did not load, why, and that what is shown is the last
 // reading. `why`: { limited } (the limit caused it), { refusedAbove } (the
 // open apps' panel says why), { unreadable } (an answer came back that could
-// not be read: not "did not answer", as News and the screener say it).
+// not be read: not "did not answer", as News and the screener say it),
+// { failure } (what failed, RateLimitWait.failure: EODHD's error is named
+// with its status -- a 500 read "EODHD did not answer, or the connection
+// dropped"; a dropped connection keeps those words).
 window.SentimentStaleNote = (stale, tracked, why) => {
   const w = why || {};
   const all = (stale || []).length >= (tracked || []).length;
@@ -219,7 +306,9 @@ window.SentimentStaleNote = (stale, tracked, why) => {
   const reason = w.refusedAbove ? ' — see the panel above.'
     : w.limited ? ': ' + ((window.RateLimitWait && window.RateLimitWait.REACHED) || "EODHD's per-minute request limit was reached.")
       : w.unreadable ? ': ' + ((window.RateLimitWait && window.RateLimitWait.UNREADABLE) || 'EODHD sent a response the app could not read.')
-        : ' — EODHD did not answer, or the connection dropped.';
+        : w.failure && w.failure.status && window.RateLimitWait
+          ? (window.RateLimitWait.hostSaysKey(w.failure) ? ' — see the panel above.' : ': ' + window.RateLimitWait.failReason(w.failure))
+          : ' — EODHD did not answer, or the connection dropped.';
   return head + reason + (all ? ' The readings shown are the last ones loaded.' : ' Their readings shown are the last ones loaded.');
 };
 
@@ -231,13 +320,20 @@ window.SentimentStaleNote = (stale, tracked, why) => {
 // load", every ticker unknown is said so -- both read "nothing came back".
 // `status.unreadable`: what came back could not
 // be read, and the line says so (it said "did not load" with no reason).
+// `status.unavailable`: tickers the endpoint refuses; all of
+// them is said so, not "nothing came back".
+// `status.failure`: what failed (RateLimitWait.failure), named: "the request
+// for the tracked tickers did not load." gave no reason at a 500, a dropped
+// connection, and after a list with M&M.NSE.
 window.SentimentEmptyNote = (kind, trackedCount, refused, notServed, status) => {
   if (refused) return notServed;
   if (!trackedCount) return null;
   const head = kind === 'buzz' ? 'No mention counts' : 'No sentiment reading';
   if (status && status.failed > 0 && status.unreadable) return `${head} — the request for the tracked tickers did not load: ${(window.RateLimitWait && window.RateLimitWait.UNREADABLE) || 'EODHD sent a response the app could not read.'}`;
+  if (status && status.failed > 0 && status.failure && window.RateLimitWait) return `${head} — ${window.RateLimitWait.failText('the request for the tracked tickers', status.failure)}`;
   if (status && status.failed > 0) return `${head} — the request for the tracked tickers did not load.`;
   if (status && status.unknown >= trackedCount) return `${head} — EODHD does not know any of the tracked tickers.`;
+  if (status && status.unavailable >= trackedCount) return `${head} — sentiment data is not available for the tracked tickers.`;
   return kind === 'buzz'
     ? 'No mention counts — nothing came back for the tracked tickers.'
     : 'No sentiment reading — nothing came back for the tracked tickers.';
@@ -355,6 +451,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   const [sentimentData, setSentimentData] = React.useState({});
   // Tickers EODHD answered "Symbol not found" for: marked on their cards.
   const [unknownTickers, setUnknownTickers] = React.useState([]);
+  // Tickers the endpoint refuses (400 on `s`): marked on their cards, with
+  // Remove, while the others load as usual.
+  const [unavailableTickers, setUnavailableTickers] = React.useState([]);
   // Tickers whose request failed (a 5xx, the limit, the network): not "no
   // data", and asked again by Try again.
   const [failedTickers, setFailedTickers] = React.useState([]);
@@ -363,6 +462,11 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   const [staleTickers, setStaleTickers] = React.useState([]);
   // The failed request's answer came back and could not be read.
   const [failUnreadable, setFailUnreadable] = React.useState(false);
+  // What the failed tickers' request failed with (RateLimitWait.failure),
+  // for the line's reason: kept as it was, so a limit's words stay the
+  // limit's once its wait is over -- they turned into "did not load." with
+  // no reason the second it ended.
+  const [failCause, setFailCause] = React.useState(null);
   // Where the last press inside the wait was ('news': the ticker news's Try
   // again, which says why next to itself), so the note shows once.
   const [heldAt, setHeldAt] = React.useState(null);
@@ -432,6 +536,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   // With the focus elsewhere, Escape closes the open panel as a layer.
   (window.useEscLayer || (() => {}))(showSearch, closeAddPanel);
   const [addNote, setAddNote] = React.useState(null);
+  // The ticker + Add put on the list, until its first read says whether the
+  // endpoint takes it.
+  const justAddedRef = React.useRef(null);
   // What a link named that is no ticker.
   const [linkNote, setLinkNote] = React.useState(() => linkSkipNote(bootLinkRef.current));
   // A link followed while the page is open: nothing re-mounts, so the view
@@ -467,7 +574,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   const resultsRowsRef = React.useRef([]);
   // The query a request is out for, from the keystroke to its answer: while
   // it is the text in the field, Enter waits for that answer, never an older
-  // one kept for the same text (on d707b8b).
+  // one kept for the same text.
   const inFlightRef = React.useRef(null);
   // The last search for the text did not answer (a 500, no network): Enter
   // asks again rather than saying "No ticker matches". Holds
@@ -487,8 +594,19 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   apiKeyNowRef.current = apiKey;
   // What the field says about a failed search, by its kind. A refusal the
   // host's panel already explains (the open apps' frame) is not said twice.
-  const searchFailNote = (kind) => {
+  // `err`: what the search threw, for the reason, as the other ticker
+  // searches name it: "did not answer" stood for a 500 too.
+  // A refusal is said as the options search says it (SymbolCode.
+  // searchFailNote): the key (401), the day's limit (402), the plan (403),
+  // and under a host's panel the key or the day point at it. It read "was
+  // refused for this key or plan" for all three, and under a host it went
+  // even at 403. `err`: the refusal
+  // kept from the search that got it (searchRefusedRef).
+  const searchFailNote = (kind, err) => {
     if (kind === 'refused') {
+      const SC = window.SymbolCode;
+      const st = err && typeof err === 'object' ? (Number(err.upstreamStatus) || Number(err.status) || Number(err.statusCode) || 0) : 0;
+      if (SC && SC.searchFailNote && (st === 401 || st === 402 || st === 403)) return SC.searchFailNote(err, 0);
       return window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()
         ? null : 'The ticker search was refused for this key or plan.';
     }
@@ -498,7 +616,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     // with no count, while the search ran again by itself.
     if (kind === 'limited') return limitWords(true);
     if (kind === 'timeout') return 'The ticker search took too long and was stopped. Press Enter to try again.';
-    return 'The ticker search did not answer. Press Enter to try again.';
+    const SC = window.SymbolCode;
+    return SC && SC.searchFailNote ? SC.searchFailNote(err || {}, 0, 'Press Enter to try again.')
+      : 'The ticker search did not load: EODHD did not answer, or the connection dropped. Press Enter to try again.';
   };
   // The limit's line: the search's words, or the bare limit for what Enter
   // asked (a typed code's check), as Backtester's picker says them.
@@ -516,7 +636,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   // `redo`: what was stopped when it was not the search -- Enter's check of
   // a typed code -- done again instead.
   const [searchLimit, setSearchLimit] = React.useState(null);
-  const limitedSearch = (query, redo) => setSearchLimit({ failure: Object.assign(window.RateLimitWait.failure({ rateLimited: true }), { status: 429 }), query, redo: redo || null });
+  const limitedSearch = (query, redo) => setSearchLimit({ failure: Object.assign(window.RateLimitWait.failure({ rateLimited: true }, query), { status: 429 }), query, redo: redo || null });
   // The panel's own wait: a press of its Try again or an Enter inside it
   // sends nothing, and its note says so under the button -- not in the
   // notice above, which is Refresh's.
@@ -538,7 +658,8 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     if (l.redo) { setAddNote(null); l.redo(); return; }
     setSearchTry((n) => n + 1);
   };
-  window.RateLimitWait.useReloadAfterWait(searchLimit && searchLimit.failure, searchAgain, 'search:sentiment');
+  // `asked`: another query is another attempt.
+  window.RateLimitWait.useReloadAfterWait(searchLimit && searchLimit.failure, searchAgain, 'search:sentiment', { asked: searchQuery });
   // The search did not answer (EODHD's error, no connection, past its time):
   // the text it was for. A Try again under the line asks it again, as Enter
   // does, and reads "Loading…" while it is out; the line stays until it
@@ -705,7 +826,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         resultsQueryRef.current = searchQuery;
         resultsRowsRef.current = [];
         setSearchResults([]);
-        setAddNote(searchFailNote(held));
+        setAddNote(searchFailNote(held, held === 'refused' ? searchRefusedRef.current : null));
         setDownFor(null);
         endRetryBusy(false);
         if (held === 'limited') limitedSearch(searchQuery);
@@ -736,7 +857,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       try {
         // Capped: a search that hangs is told as one after ANSWER_MS, and
         // Enter can ask again. The answer arriving after the
-        // cap is dropped: "stopped" has been said (accepted; CI on r24). The
+        // cap is dropped: "stopped" has been said (accepted). The
         // time counts from when the request is sent: inside a 429's wait the
         // Mini App's client holds it and asks again after
         // (SymbolCode.searchDeadline).
@@ -762,7 +883,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         const sameKey = apiKey === apiKeyNowRef.current;
         // The client's wait when it has one (Retry-After, TASK-429), else a minute.
         if (sameKey && kind === 'limited') searchLimitedUntilRef.current = window.RateLimitWait.until() || Date.now() + window.SentimentSearchWait.LIMIT_MS;
-        if (sameKey && kind === 'refused') searchRefusedRef.current = true;
+        if (sameKey && kind === 'refused') searchRefusedRef.current = e || true;
         // Said whether or not an Enter is waiting: a hang ended in silence.
         if (!latest()) return;
         searchFailedRef.current = kind;
@@ -771,7 +892,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         // At the limit an Enter kept for this text is kept for the search
         // after the wait, as above.
         if (kind !== 'limited') pendingEnterRef.current = null;
-        setAddNote(searchFailNote(kind));
+        setAddNote(searchFailNote(kind, e));
         setDownFor(kind === 'down' || kind === 'timeout' ? searchQuery : null);
         endRetryBusy(false);
         if (kind === 'limited') limitedSearch(searchQuery); else setSearchLimit(null);
@@ -843,6 +964,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       const missing = trackedTickers.filter(t => !Array.isArray(cachedFor(t)));
       trackedTickers.forEach(t => { const c = cachedFor(t); results[t] = Array.isArray(c) ? c : []; });
       const unknown = trackedTickers.filter(t => force !== true && Cache.missing(apiKey, t));
+      const unavailable = trackedTickers.filter(t => force !== true && Cache.unavailable(apiKey, t));
       let failed = [];
       // What the failed request was (RateLimitWait.failure): an answer that
       // could not be read is said as that, not as "did not answer".
@@ -855,10 +977,11 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
             (list) => window.EODHD_API.getSentimentData(apiKey, list.join(','), undefined, undefined, { throwErrors: true }));
           const byKey = got.data;
           got.missing.forEach(ticker => { Cache.putMissing(apiKey, ticker); unknown.push(ticker); });
+          (got.unavailable || []).forEach(ticker => { Cache.putUnavailable(apiKey, ticker); unavailable.push(ticker); });
           failed = (got.failed || []).slice();
           failErr = got.failure || null;
           missing.forEach(ticker => {
-            if (got.missing.indexOf(ticker) !== -1) return;
+            if (got.missing.indexOf(ticker) !== -1 || unavailable.indexOf(ticker) !== -1) return;
             const base = ticker.split('.')[0];
             let items = byKey[ticker] || byKey[base] || byKey[ticker.toUpperCase()] || null;
             if (!Array.isArray(items)) {
@@ -914,9 +1037,22 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       setSentimentData(results);
       shownSentRef.current = { sig, data: results };
       setUnknownTickers(unknown);
+      setUnavailableTickers(unavailable);
+      // The ticker just added, refused on its first read: not kept in the
+      // saved list, and the line under + Add says why, as for M&M. A saved list's own refused ticker stays, with its
+      // card's Remove.
+      const added = justAddedRef.current;
+      if (added && latest && trackedTickers.indexOf(added) !== -1) {
+        justAddedRef.current = null;
+        if (unavailable.indexOf(added) !== -1) {
+          setTrackedTickers(prev => baseTickers(prev).filter(t => t !== added));
+          setAddNote(window.SentimentUnavailableNote(added));
+        }
+      }
       setFailedTickers(failed);
       setStaleTickers(keptFromBefore);
       setFailUnreadable(Boolean(failed.length && failErr && window.RateLimitWait.failure(failErr).unreadable));
+      setFailCause(failed.length ? window.RateLimitWait.failure(failErr) : null);
 
       // Overall score: the mention-weighted average of normalized sentiment
       // across tickers, read against the tone of large US stocks
@@ -1011,12 +1147,23 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     // A row naming nothing readable is said, not stored.
     const symbol = window.SymbolCode.fromRow(item);
     if (!symbol) { setAddNote('"' + String(item && item.Code || '').slice(0, 24) + '" from the search is not a ticker this page can track.'); return; }
+    // The endpoint takes no symbol with anything else than letters, digits,
+    // ".", "_" and "-": "M&M" + Enter added M&M.NSE, and the list it joined
+    // was refused whole. Not added; the line
+    // says so and the field stays open.
+    if (!window.SentimentSymbolOk(symbol)) { setAddNote(window.SentimentUnavailableNote(symbol)); setActiveResult(-1); return; }
+    // One the endpoint refused already (kept ten minutes): BAD.US, removed
+    // and picked again, passed the check above and was saved again.
+    const SC = window.SentimentCache;
+    if (SC && typeof SC.unavailable === 'function' && SC.unavailable(apiKey, symbol)) { setAddNote(window.SentimentUnavailableNote(symbol)); setActiveResult(-1); return; }
     // Picking a ticker that is already tracked used to spend the search
     // request and then do nothing anybody could see.
     if (trackedTickers.includes(symbol)) {
       setAddNote(symbol + ' is already tracked');
     } else {
       setAddNote(null);
+      // Refused when it is first read: taken off the list again (justAddedRef).
+      justAddedRef.current = symbol;
       // From the stored list, which another tab may have changed since.
       setTrackedTickers(prev => { const base = baseTickers(prev); return base.includes(symbol) ? base : [...base, symbol]; });
       window.Haptics?.medium();
@@ -1232,8 +1379,15 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   // the terminal has none). "No data" and "nothing came back" would then read
   // as an empty answer; they say what happened instead, in the other views' words.
   const refusedAbove = Boolean(window.Entitlement && window.Entitlement.explained && window.Entitlement.explained());
-  const NOT_SERVED_LINE = 'Nothing below is missing data — the request was not served. See the panel above.';
-  const emptyStatus = { failed: failedTickers.length, unknown: unknownTickers.length, unreadable: failUnreadable && !gaugeLimited };
+  // What did not load, pointing to the panel: "Nothing below is missing
+  // data" is the panel's sentence, never a view's.
+  const NOT_SERVED_LINE = RLW.panelLine('The sentiment data');
+  // The limit is why when the failure itself was the limit, during its wait
+  // and after it (failCause), or when it came inside a wait (useCause).
+  const failLimited = gaugeLimited || Boolean(failedTickers.length && failCause && failCause.limited);
+  const emptyStatus = { failed: failedTickers.length, unknown: unknownTickers.length, unreadable: failUnreadable && !failLimited, failure: failCause };
+  // And the tickers the endpoint refuses.
+  emptyStatus.unavailable = unavailableTickers.length;
   const Sparkline = ({ data, width = 80, height = 20 }) => {
     // One day is a reading, not "no data": "50 / 100 · 1d" stood next to
     // "no data". A line needs two days.
@@ -1378,7 +1532,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           {loading ? (
             <div style={{ padding: 40, opacity: 0.7, fontSize: 13 }}>Loading sentiment data...</div>
           ) : error ? (
-            <div style={{ padding: 40, color: C3.error, fontSize: 13 }}>{error}</div>
+            <div data-own-fail="sentiment" style={{ padding: 40, color: C3.error, fontSize: 13 }}>{error}</div>
           ) : isDemo ? (
             <SentimentGauge score={demoScore} />
           ) : overallScore == null ? (
@@ -1387,7 +1541,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
             // button read as disabled.
             <div style={{ padding: '40px 0', fontSize: 13 }}>
               {window.SentimentEmptyNote('gauge', trackedTickers.length, refusedAbove, NOT_SERVED_LINE, emptyStatus) && (
-                <span style={{ opacity: 0.7 }}>{failedTickers.length > 0 && !refusedAbove && gaugeLimited
+                <span data-own-fail={refusedAbove || failedTickers.length > 0 ? 'sentiment' : undefined} data-see-panel={refusedAbove ? 'true' : undefined} style={{ opacity: 0.7 }}>{failedTickers.length > 0 && !refusedAbove && failLimited
                   ? 'No sentiment reading — ' + RLW.REACHED
                   : window.SentimentEmptyNote('gauge', trackedTickers.length, refusedAbove, NOT_SERVED_LINE, emptyStatus)}</span>
               )}
@@ -1403,16 +1557,22 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           ) : (
             <SentimentGauge score={overallScore} />
           )}
-          <div style={{ fontSize: 11, opacity: 0.7, marginTop: 12 }}>
-            {window.SentimentAggregateLine(trackedTickers, sentimentData, overallScore, { failed: failedTickers, unknown: unknownTickers })}
+          {/* Names the tickers that did not load: a failure line then. */}
+          <div data-own-fail={failedTickers.length ? 'sentiment' : undefined} style={{ fontSize: 11, opacity: 0.7, marginTop: 12 }}>
+            {window.SentimentAggregateLine(trackedTickers, sentimentData, overallScore, { failed: failedTickers, unknown: unknownTickers, unavailable: unavailableTickers })}
           </div>
           {/* A Refresh that failed: the last readings stay on screen, and
               this says the refresh did not load, and why. */}
-          {!loading && staleTickers.length > 0 && (
-            <p role="status" data-sent-stale="true" style={{ margin: '8px 0 0', fontSize: 12, lineHeight: 1.5, color: isDark ? C3.textDark : C3.textLightTheme }}>
-              {window.SentimentStaleNote(staleTickers, trackedTickers, { limited: gaugeLimited, refusedAbove, unreadable: failUnreadable && !gaugeLimited })}
-            </p>
-          )}
+          {/* A failure line (data-own-fail), with what failed (failCause):
+              it was unmarked, and a 500 read as a dropped connection. */}
+          {!loading && staleTickers.length > 0 && (() => {
+            const staleWords = window.SentimentStaleNote(staleTickers, trackedTickers, { limited: failLimited, refusedAbove, unreadable: failUnreadable && !failLimited, failure: failCause });
+            return (
+              <p role="status" data-sent-stale="true" data-own-fail="sentiment" data-see-panel={/see the panel above/.test(staleWords) ? 'true' : undefined} style={{ margin: '8px 0 0', fontSize: 12, lineHeight: 1.5, color: isDark ? C3.textDark : C3.textLightTheme }}>
+                {staleWords}
+              </p>
+            );
+          })()}
           {/* Some tickers failed beside a reading: Try again asks for those
               only (the answered ones are kept). */}
           {!loading && overallScore != null && failedTickers.length > 0 && (
@@ -1422,7 +1582,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
             }} />
           )}
           {rlWait.note && heldAt !== 'news' && (
-            <p data-wait-note="true" style={{ margin: '10px 0 0', fontSize: 13, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p>
+            <p data-wait-note="true" data-own-fail="sentiment" style={{ margin: '10px 0 0', fontSize: 13, color: isDark ? C3.textDark : C3.textLightTheme }}>{rlWait.note}</p>
           )}
         </div>
 
@@ -1447,7 +1607,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           </button>
         </div>
         {/* Always there, so a reader hears a line when it appears. */}
-        <div role="status" aria-live="polite" data-sent-add-note={addNote ? 'true' : undefined}
+        <div role="status" aria-live="polite" data-sent-add-note={addNote ? 'true' : undefined} data-own-fail="search" data-see-panel={RLW.seesPanel(addNote)}
              style={addNote ? { fontSize: 11, marginBottom: 8, color: isDark ? C3.textMutedDark : C3.textMutedLight, overflowWrap: 'anywhere' } : undefined}>{addNote || ''}</div>
         {/* At the limit, as the shared picker draws it (PortalDropdown,
             RetryAfterWait): Try again counting the wait down, outside the
@@ -1461,7 +1621,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
               color: isDark ? C3.textDark : C3.textLightTheme,
             }} />
             {addWait.note && (
-              <span data-rl-note="true" style={{ display: 'block', marginTop: 6, fontSize: 12, fontWeight: 400, lineHeight: 1.4, color: isDark ? C3.textDark : C3.textLightTheme }}>{addWait.note}</span>
+              <span data-rl-note="true" data-own-fail="search" style={{ display: 'block', marginTop: 6, fontSize: 12, fontWeight: 400, lineHeight: 1.4, color: isDark ? C3.textDark : C3.textLightTheme }}>{addWait.note}</span>
             )}
           </div>
         )}
@@ -1553,7 +1713,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                       const kind = searchFailedRef.current;
                       if (kind === 'limited' && Date.now() < searchLimitedUntilRef.current) { holdEnter(); return; }
                       if (kind === 'refused') {
-                        setAddNote(searchFailNote(kind));
+                        setAddNote(searchFailNote(kind, searchRefusedRef.current));
                         return;
                       }
                       setAddNote(null);
@@ -1678,7 +1838,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                   {/* For the keyboard and for assistive technology; the mouse
                       goes through it to the card (and to the titles on it). */}
                   <button type="button" aria-pressed={isSelected} data-sent-card={ticker}
-                    aria-label={unknownTickers.indexOf(ticker) !== -1 ? `${tickerLabel}: not found on EODHD` : failedTickers.indexOf(ticker) !== -1 && !refusedAbove && !(sentimentData[ticker] || []).length ? `${tickerLabel}: did not load` : `${tickerLabel} sentiment${score != null ? ' ' + score + ' of 100' : ''}`}
+                    aria-label={unavailableTickers.indexOf(ticker) !== -1 ? `${tickerLabel}: sentiment data is not available` : unknownTickers.indexOf(ticker) !== -1 ? `${tickerLabel}: not found on EODHD` : failedTickers.indexOf(ticker) !== -1 && !refusedAbove && !(sentimentData[ticker] || []).length ? `${tickerLabel}: did not load` : `${tickerLabel} sentiment${score != null ? ' ' + score + ' of 100' : ''}`}
                     onClick={(e) => { e.stopPropagation(); setSelectedTicker(isSelected ? null : ticker); }}
                     style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', background: 'none', border: 'none', padding: 0, margin: 0, borderRadius: 'inherit', pointerEvents: 'none' }} />
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
@@ -1693,11 +1853,23 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                       {'\u00D7'}
                     </button>
                   </div>
-                  {unknownTickers.indexOf(ticker) !== -1
+                  {/* The endpoint refuses this ticker: said, with Remove, and the
+                      other cards load as usual. */}
+                  {unavailableTickers.indexOf(ticker) !== -1
+                    ? <div data-sent-unavailable={ticker} data-own-fail="sentiment" style={{ fontSize: 11, lineHeight: 1.4, color: isDark ? C3.textDark : C3.textLightTheme, overflowWrap: 'anywhere' }}>
+                        {window.SentimentUnavailableNote(ticker)}
+                        <button type="button" data-sent-remove={ticker} onClick={(e) => { e.stopPropagation(); removeTicker(ticker); }}
+                          aria-label={`Remove ${tickerLabel}`}
+                          style={{ display: 'block', marginTop: 6, padding: '4px 12px', minHeight: 32, minWidth: 44, borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 600,
+                            background: 'none', border: '1px solid ' + (isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.25)'), color: isDark ? C3.textDark : C3.textLightTheme }}>
+                          Remove
+                        </button>
+                      </div>
+                    : unknownTickers.indexOf(ticker) !== -1
                     ? <div data-sent-unknown={ticker} style={{ height: 20, display: 'flex', alignItems: 'center', fontSize: 10, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>not found on EODHD</div>
                     // A refusal the host's panel explains reads "not served" (Sparkline).
                     : failedTickers.indexOf(ticker) !== -1 && !refusedAbove && !(sentimentData[ticker] || []).length
-                    ? <div data-sent-failed={ticker} style={{ height: 20, display: 'flex', alignItems: 'center', fontSize: 10, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>did not load</div>
+                    ? <div data-sent-failed={ticker} data-own-fail="sentiment" style={{ height: 20, display: 'flex', alignItems: 'center', fontSize: 10, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>did not load</div>
                     : <Sparkline data={sentimentData[ticker] || []} width={80} height={20} />}
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 }}>
                     <span title={(sentimentData[ticker] || []).length ? `Average over ${(sentimentData[ticker] || []).length} days with news, weighted by mentions` : undefined}
@@ -1784,7 +1956,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
               );
             })}
             {buzzData.length === 0 && (loading || window.SentimentEmptyNote('buzz', trackedTickers.length, refusedAbove, NOT_SERVED_LINE, emptyStatus)) && (
-              <div style={{ fontSize: 12, opacity: 0.7, padding: 12 }}>
+              <div data-own-fail={!loading && (refusedAbove || failedTickers.length > 0) ? 'sentiment' : undefined} data-see-panel={!loading && refusedAbove ? 'true' : undefined} style={{ fontSize: 12, opacity: 0.7, padding: 12 }}>
                 {loading ? 'Loading mention counts…' : window.SentimentEmptyNote('buzz', trackedTickers.length, refusedAbove, NOT_SERVED_LINE, emptyStatus)}
               </div>
             )}
@@ -1813,7 +1985,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                 </div>
               ) : newsBreakdown && newsBreakdown.failed ? (
                 <div style={{ ...cardStyle, padding: 20, textAlign: 'center', fontSize: 13 }}>
-                  <div style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: 10 }}>
+                  <div data-own-fail="news" style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: 10 }}>
                     {/* A dropped connection or a timeout (status 0) is named
                         too: it read "Could not load news for AAPL." with no
                         reason. */}
