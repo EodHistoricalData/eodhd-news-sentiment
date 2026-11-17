@@ -48,6 +48,7 @@ const FILES = [
   "vendor/HelpTooltip.js",
   "vendor/aiText.js",
   "vendor/aiFeatures.js",
+  "vendor/sentimentScore.js",
   "vendor/sentiment.js",
   "vendor/news.js",
   "app.js"

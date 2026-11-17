@@ -919,10 +919,11 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       setFailUnreadable(Boolean(failed.length && failErr && window.RateLimitWait.failure(failErr).unreadable));
 
       // Overall score: the mention-weighted average of normalized sentiment
-      // across tickers, mapped from [-1, 1] to [0, 100]. Null when nothing
-      // came back -- a gauge has to be allowed to say "no reading".
+      // across tickers, read against the tone of large US stocks
+      // (SentimentScore.scale, 0-100). Null when nothing came back -- a gauge
+      // has to be allowed to say "no reading".
       const avg = weightedNormalized(Object.values(results).flat());
-      setOverallScore(avg == null ? null : Math.round(Math.max(0, Math.min(100, (avg + 1) * 50))));
+      setOverallScore(window.SentimentScore.scale(avg));
     } catch (e) {
       if (reqId !== sentimentReqRef.current) return;
       if (!(window.Entitlement && window.Entitlement.explained())) setError('Failed to load sentiment data');
@@ -1050,25 +1051,18 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   const getTickerScore = (ticker) => {
     const items = sentimentData[ticker];
     if (!items || items.length === 0) return null;
-    const avg = weightedNormalized(items);
-    return avg == null ? null : Math.round(Math.max(0, Math.min(100, (avg + 1) * 50)));
+    return window.SentimentScore.scale(weightedNormalized(items));
   };
 
   // --- Helper: sentiment trend direction ---
   const getTrend = (ticker) => {
     const items = sentimentData[ticker];
     if (!items || items.length < 2) return 'flat';
-    // Compare first half average to second half average
-    const mid = Math.floor(items.length / 2);
-    const recent = items.slice(0, mid);
-    const older = items.slice(mid);
-    const recentAvg = weightedNormalized(recent);
-    const olderAvg = weightedNormalized(older);
-    if (recentAvg == null || olderAvg == null) return 'flat';
-    const diff = recentAvg - olderAvg;
-    if (diff > 0.05) return 'up';
-    if (diff < -0.05) return 'down';
-    return 'flat';
+    // The newer half of the days against the older half, by date rather
+    // than by the answer's order.
+    const days = window.SentimentScore.chronological(items).reverse();
+    const mid = Math.floor(days.length / 2);
+    return window.SentimentScore.trend(weightedNormalized(days.slice(0, mid)), weightedNormalized(days.slice(mid)));
   };
 
   // --- Helper: score color ---
@@ -1256,9 +1250,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           : <span style={{ fontSize: 10, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>no data</span>}
       </div>;
     }
-    // Oldest on the left. The readings are kept newest first, and drawn in
-    // that order a rising sentiment was a falling red line.
-    const values = [...data].sort((a, b) => new Date(a.date) - new Date(b.date)).map(d => (d.normalized || 0));
+    // Oldest on the left. /sentiments answers newest first, and the line was
+    // drawn in that order: time ran right to left, a rising tone fell and
+    // was coloured red, beside the trend arrow pointing up.
+    const values = window.SentimentScore.chronological(data).map(d => (d.normalized || 0));
     const min = Math.min(...values);
     const max = Math.max(...values);
     const range = max - min || 1;
@@ -1355,7 +1350,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
             name was "Market Sentiment What is Market Sentiment?". */}
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
           <h1 ref={retryHeadingRef} tabIndex={-1} style={{ fontWeight: 700, fontSize: 16, margin: 0 }}>Market Sentiment</h1>
-          {window.HelpTooltip && <HelpTooltip title="Market Sentiment" text="Gauge overall market mood and per-ticker sentiment. Tracks social buzz, analyst ratings, and price momentum to help time your entries." isDark={isDark} />}
+          {window.HelpTooltip && <HelpTooltip title="Market Sentiment" text="Gauge overall market mood and per-ticker sentiment. Tracks social buzz, analyst ratings, and price momentum to help time your entries. Scored against the news tone of the 100 largest US stocks over 30 days: a typical stock reads about 55, Extreme Greed is the most positive tenth, Extreme Fear the least." isDark={isDark} />}
         </div>
         {/* Busy while the readings load: a press then joins the request on
             its way (refresh). The dot is News's sign for the same. */}
@@ -1706,7 +1701,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                     : <Sparkline data={sentimentData[ticker] || []} width={80} height={20} />}
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 }}>
                     <span title={(sentimentData[ticker] || []).length ? `Average over ${(sentimentData[ticker] || []).length} days with news, weighted by mentions` : undefined}
-                      style={{ fontSize: 18, fontWeight: 700, color: scoreColor(score) }}>{sc}{score != null && <span style={{ fontSize: 10, fontWeight: 500, opacity: isDark ? 0.7 : 1 }}>/100{(sentimentData[ticker] || []).length ? ` · ${(sentimentData[ticker] || []).length}d` : ''}</span>}</span>
+                      style={{ fontSize: 18, fontWeight: 700, color: scoreColor(score) }}>{sc}{score != null && <span style={{ fontSize: 10, fontWeight: 500 }}>/100{(sentimentData[ticker] || []).length ? ` · ${(sentimentData[ticker] || []).length}d` : ''}</span>}</span>
                     {/* No trend without data: a flat arrow over "no data" read as "unchanged". */}
                     {(isDemo || (sentimentData[ticker] && sentimentData[ticker].length >= 2)) && (
                       <span style={{ fontSize: 16, fontWeight: 700, color: trendColor }}
