@@ -37,6 +37,16 @@
   // positive tenth. A typical stock (0.819) reads 54. The EODHD Score keeps
   // a copy of this list for its sentiment part, and a test holds the two equal
   // (the terminal's server).
+  //
+  // Measured again 17.11.2026 (S&P 100, 30-day mention-weighted tone as of
+  // 16.11): median 0.820 -> 54; Extreme Fear 14, Fear 12, Neutral 46, Greed 19,
+  // Extreme Greed 7 of 98, so the scale holds on its universe. But tone falls
+  // with coverage: corr(log mentions, tone) = -0.60. The ten most-covered
+  // names (median 1,160 articles a month) have a median tone of 0.668 -> 25;
+  // names with ~100 articles a month 0.842 -> 58. AAPL read below 45 in 20 of
+  // 24 weekly readings, TSLA 18, INTC 16, META 15. The score is relative to
+  // large US stocks, not a verdict on the news: almost every day's tone is
+  // positive, and Fear means less positive than most of them.
   const TONE_ANCHORS = [[-1, 0], [0.70, 25], [0.77, 45], [0.88, 65], [0.94, 80], [1, 100]];
 
   // Mention-weighted tone (-1..1) -> 0..100, or null for no number. Out of
@@ -54,6 +64,73 @@
       }
     }
     return 100;
+  }
+
+  // The five labels and where they start on the 0-100 scale, highest first.
+  // One list for every place that names a score: the Sentiment page (gauge,
+  // cards, the day counts), the dashboard widget and the EODHD Score card.
+  // The widget said Bullish/Neutral/Bearish at 60/40 beside the page's
+  // labels at 80/65/45/25. The terminal's server keeps a copy for the
+  // Score's detail line (SENTIMENT_LABELS).
+  const LABELS = [[80, 'Extreme Greed'], [65, 'Greed'], [45, 'Neutral'], [25, 'Fear'], [0, 'Extreme Fear']];
+  function label(score) {
+    if (typeof score !== 'number' || !Number.isFinite(score)) return null;
+    for (let i = 0; i < LABELS.length; i++) if (score >= LABELS[i][0]) return LABELS[i][1];
+    return LABELS[LABELS.length - 1][1];
+  }
+
+  // The colour a score is drawn in goes by the same cutoffs: 'neg' below 45
+  // (Fear, Extreme Fear), 'neutral' 45-64 (Neutral), 'pos' from 65 (Greed,
+  // Extreme Greed); null for no number. The page coloured at 35/65 and the
+  // widget at 40/60, so one number was red in one place and yellow in the
+  // other.
+  function band(score) {
+    if (typeof score !== 'number' || !Number.isFinite(score)) return null;
+    return score >= 65 ? 'pos' : score >= 45 ? 'neutral' : 'neg';
+  }
+
+  // The page's inks for a band (window.C3): the bright ones on the dark
+  // theme, the darker ones on the light theme (2-2.5:1 on white otherwise).
+  // `base`: the band's colour itself, for a fill or a tint, either theme.
+  function color(score, isDark, base) {
+    const C3 = (typeof window !== 'undefined' && window.C3) || {};
+    const b = band(score);
+    if (!b) return isDark ? (C3.textMutedDark || '#A39B89') : (C3.textMutedLight || '#4b5563');
+    if (b === 'pos') return isDark || base ? (C3.success || '#21CE99') : (C3.successLight || '#047857');
+    if (b === 'neg') return isDark || base ? (C3.error || '#F23645') : (C3.errorLight || '#c81e2c');
+    return isDark || base ? (C3.warning || '#F0B90B') : '#a16207';
+  }
+
+  // A ticker's days by the same five labels: each day's tone through scale(),
+  // as the score is. The cards counted days on fixed tone bands ("strongly
+  // positive, tone 0.7 or more"), and "16 strongly positive days, 0 negative
+  // days" stood under "Extreme Fear": the score is relative,
+  // those bands were not. Days without a tone are not counted.
+  function dayCounts(rows) {
+    const out = {};
+    LABELS.forEach((l) => { out[l[1]] = 0; });
+    (rows || []).forEach((d) => {
+      const v = d ? d.normalized : null;
+      if (v == null || v === '') return;
+      const l = label(scale(Number(v)));
+      if (l) out[l]++;
+    });
+    return out;
+  }
+
+  // The rows the Sentiment page reads for a ticker: its PAGE_DAYS newest
+  // days, newest first, by date ('YYYY-MM-DD'; a sort that keeps rows of one
+  // date in their order, rows without a date last). The page asks
+  // /sentiments with no dates and keeps these; the card's "· 30d" counts
+  // them. The EODHD Score's sentiment part reads the same rows (the terminal's server,
+  // latest_sentiment_rows): it kept every row from 30 days back, 31 dates,
+  // and read MSFT 28 from 1,597 articles where the page read 29 from 1,588.
+  // There is no date cutoff here, so the two agree whether or
+  // not today's row is in yet.
+  const PAGE_DAYS = 30;
+  function latest(rows, n) {
+    const key = (d) => String((d && d.date) || '').slice(0, 10);
+    return (rows || []).slice().sort((a, b) => key(b).localeCompare(key(a))).slice(0, n == null ? PAGE_DAYS : n);
   }
 
   // Which way a ticker's tone went: the newer half of its days against the
@@ -129,5 +206,8 @@
     };
   }
 
-  window.SentimentScore = { codeFor, rowsFor, summarize, scale, TONE_ANCHORS, trend, chronological, MIN_MENTIONS, WINDOW_DAYS };
+  window.SentimentScore = {
+    codeFor, rowsFor, summarize, scale, TONE_ANCHORS, trend, chronological, MIN_MENTIONS, WINDOW_DAYS,
+    LABELS, label, band, color, dayCounts, latest, PAGE_DAYS,
+  };
 })();

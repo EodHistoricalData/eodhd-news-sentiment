@@ -1,23 +1,27 @@
 // Sentiment Module — Market Sentiment Analysis View
 // Full-screen view with gauge, per-ticker sentiment, social buzz, and news breakdown
 
-// Days by news tone, on EODHD's -1..1 scale. A +/-0.1 cut put every day of
-// AAPL, MSFT and NVDA in "+" ("30+ 0- 0~"): large caps' daily tone runs
-// 0.5-0.99, so the split said nothing (p.25). Four bands instead:
-// strongly positive >= 0.7, positive 0.3-0.7, neutral -0.3..0.3, negative
-// below -0.3 -- the same scale the 0-100 score maps to (0.7 = 85, 0.3 = 65).
+// A ticker's days by news tone, on the score's own scale. A +/-0.1 cut put
+// every day of AAPL, MSFT and NVDA in "+" (p.25); fixed bands on
+// EODHD's -1..1 tone (strongly positive from 0.7) then put "16 strongly
+// positive days, 0 negative days" under a score of "Extreme Fear": the score
+// is relative to large US stocks, those bands were absolute.
+// Now each day's tone goes through SentimentScore.scale and gets the
+// score's five labels and colours (SentimentScore.dayCounts).
 window.SentimentDays = {
+  // { 'Extreme Greed', Greed, Neutral, Fear, 'Extreme Fear' }: days.
   bands(items) {
-    const out = { strong: 0, positive: 0, neutral: 0, negative: 0 };
-    (items || []).forEach((d) => {
-      const n = Number(d && d.normalized);
-      if (!Number.isFinite(n)) return;
-      if (n >= 0.7) out.strong++;
-      else if (n >= 0.3) out.positive++;
-      else if (n > -0.3) out.neutral++;
-      else out.negative++;
-    });
-    return out;
+    return window.SentimentScore.dayCounts(items);
+  },
+  // The card's line, short: the days Greed or higher and Fear or lower.
+  line(c) {
+    const up = c['Extreme Greed'] + c.Greed;
+    const down = c.Fear + c['Extreme Fear'];
+    return { up, down, upText: `${up} day${up === 1 ? '' : 's'} Greed or higher,`, downText: `${down} Fear or lower` };
+  },
+  // Its tooltip and accessible name: every label.
+  describe(c) {
+    return `Days by their news tone, scored as the number above is: ${c['Extreme Greed']} Extreme Greed, ${c.Greed} Greed, ${c.Neutral} Neutral, ${c.Fear} Fear, ${c['Extreme Fear']} Extreme Fear.`;
   },
 };
 
@@ -75,16 +79,18 @@ window.SentimentNotFound = (e) => Boolean(e && (Number(e.status) === 404 || Numb
 // kept the screen so after a reload. A 400 that
 // names no parameter is read the same; one about another parameter is not.
 window.SentimentListRefused = (e) => Boolean(e && Number(e.status) === 400 && (!e.parameter || e.parameter === 's'));
-// What a symbol in such a list may be made of. One with anything else ("&")
-// is the first suspect, and is not added at + Add.
-window.SentimentSymbolOk = (t) => /^[A-Za-z0-9._-]+$/.test(String(t || ''));
+// What a symbol in such a list may be made of. One with anything else is the
+// first suspect, and is not added at + Add. "&" is in: the refusal of
+// M&M.NSE was our backend's guard, not EODHD's, and the guard now lets it
+// through in a symbol, encoded (the terminal's server).
+window.SentimentSymbolOk = (t) => /^[A-Za-z0-9._&-]+$/.test(String(t || ''));
 // What a card of such a ticker says, and the line under + Add.
 window.SentimentUnavailableNote = (t) => `Sentiment data is not available for ${t}.`;
 // The list refused as a whole is asked again without its suspects, then by
 // halves, until the symbols the endpoint refuses are found (`unavailable`) and
 // every other one is read as usual. A part that went through whole puts the
 // refusal in the other part, which is not asked again when it is one symbol:
-// AAPL, MSFT, NVDA, M&M is two requests.
+// AAPL, MSFT, NVDA, M&M was two requests while the backend refused "&".
 // A part that fails otherwise once the list is split (a 500, the limit, a
 // drop) is that part's failure: its symbols are `failed`, each with its
 // reason in `failures`, and what the other parts read stays. It escaped the
@@ -476,6 +482,8 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   // again" with no number.
   const RLW = window.RateLimitWait;
   const rlWait = RLW.useWait();
+  // The name the readings' repeat after a 429 is paced and budgeted by.
+  const SENT_READS = 'sentiment-reads';
   // Null until measured. This started at 50 and fell back to 50 when nothing
   // came back, so a refused or failed request drew a gauge reading "50 /
   // Neutral" -- an invented value in the same type as a real one.
@@ -990,7 +998,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
               if (got.answered && !got.error && !got.partial) Cache.put(apiKey, ticker, []);
               return;
             }
-            items = [...items].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 30);
+            // Its 30 newest days, newest first: the rule the EODHD Score's
+            // sentiment part reads too (SentimentScore.latest).
+            items = window.SentimentScore.latest(items, window.SentimentScore.PAGE_DAYS);
             results[ticker] = items;
             Cache.put(apiKey, ticker, items);
           });
@@ -1052,7 +1062,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       setFailedTickers(failed);
       setStaleTickers(keptFromBefore);
       setFailUnreadable(Boolean(failed.length && failErr && window.RateLimitWait.failure(failErr).unreadable));
-      setFailCause(failed.length ? window.RateLimitWait.failure(failErr) : null);
+      // With the list it was for (`asked`) and whether it was a Refresh
+      // (`force`): the repeat after a 429's wait asks that again, and a
+      // failure of a list no longer on screen is not repeated.
+      setFailCause(failed.length ? Object.assign(window.RateLimitWait.failure(failErr, trackedTickers.join(',')), { force: force === true }) : null);
 
       // Overall score: the mention-weighted average of normalized sentiment
       // across tickers, read against the tone of large US stocks
@@ -1074,12 +1087,29 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   // Only while that request is young (RateLimitWait.JOIN_MS, the shell's own
   // window): one that hangs past it is replaced by the next press.
   const refresh = () => {
+    RLW.acted(SENT_READS);
     const r = runningRef.current;
     if (r && r.sig === sigRef.current && RLW.joins(r.at)) return;
     loadSentiment(true);
   };
 
   React.useEffect(() => { loadSentiment(); }, [loadSentiment]);
+
+  // The tickers' readings at the limit (429): asked once more by themselves
+  // when the wait is over, as every other panel is (RateLimitWait.
+  // useReloadAfterWait). Only Try again asked them.
+  // If that repeat meets the limit again, Try again keeps counting
+  // the wait down and nothing is sent until it is pressed, Refresh is, or
+  // the page is opened again. The repeat is the load that failed: a Refresh
+  // asks every ticker again, a load the ones that did not come; a failure of
+  // a list since changed is not repeated (failCause.asked).
+  // Not while a load is on its way: Try again pressed during the wait left
+  // the failure up while its request loaded, and the repeat fired on top of
+  // it -- three identical paid requests.
+  RLW.useReloadAfterWait(!loading && failedTickers.length && failCause && failCause.limited ? failCause : null, () => {
+    if (RLW.focusOnRetry()) retryFocusRef.current = true;
+    loadSentiment(failCause && failCause.force ? true : undefined);
+  }, SENT_READS, { asked: trackedTickers.join(',') });
 
   // --- Load news breakdown for selected ticker ---
   React.useEffect(() => {
@@ -1148,9 +1178,8 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     const symbol = window.SymbolCode.fromRow(item);
     if (!symbol) { setAddNote('"' + String(item && item.Code || '').slice(0, 24) + '" from the search is not a ticker this page can track.'); return; }
     // The endpoint takes no symbol with anything else than letters, digits,
-    // ".", "_" and "-": "M&M" + Enter added M&M.NSE, and the list it joined
-    // was refused whole. Not added; the line
-    // says so and the field stays open.
+    // ".", "_", "&" and "-": a list with one was refused whole. Not added; the line says so and the field stays open.
+    // M&M.NSE is added since the backend lets "&" through.
     if (!window.SentimentSymbolOk(symbol)) { setAddNote(window.SentimentUnavailableNote(symbol)); setActiveResult(-1); return; }
     // One the endpoint refused already (kept ten minutes): BAD.US, removed
     // and picked again, passed the check above and was saved again.
@@ -1213,23 +1242,14 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   };
 
   // --- Helper: score color ---
-  const scoreColor = (score) => {
-    if (score === null) return isDark ? C3.textMutedDark : C3.textMutedLight;
-    // Light theme: darker inks (the dark-theme ones are 2-2.5:1 on white).
-    if (score >= 65) return isDark ? C3.success : (C3.successLight || '#047857');
-    if (score <= 35) return isDark ? C3.error : (C3.errorLight || '#c81e2c');
-    return isDark ? C3.warning : '#a16207';
-  };
+  // The one set of cutoffs (SentimentScore.band): red below 45, yellow 45-64,
+  // green from 65 -- the labels' own. This coloured at 35/65, so a 40 was
+  // "Fear" in yellow here and red on the dashboard. Light
+  // theme: the darker inks (the dark-theme ones are 2-2.5:1 on white).
+  const scoreColor = (score) => window.SentimentScore.color(score, isDark);
 
   // --- Helper: label for overall score ---
-  const getLabel = (score) => {
-    if (score == null) return 'No reading';
-    if (score >= 80) return 'Extreme Greed';
-    if (score >= 65) return 'Greed';
-    if (score >= 45) return 'Neutral';
-    if (score >= 25) return 'Fear';
-    return 'Extreme Fear';
-  };
+  const getLabel = (score) => window.SentimentScore.label(score) || 'No reading';
 
   // --- Social buzz: count mentions from sentimentData ---
   // Only tickers a reading came back for. A refused or empty answer used to
@@ -1313,6 +1333,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
 
     const label = getLabel(score);
     const color = scoreColor(score);
+    const dialAt = (s) => ((1 - Math.cos(Math.PI * s / 100)) / 2 * 100).toFixed(1);
 
     return (
       <div style={{ textAlign: 'center', marginBottom: 8 }}>
@@ -1322,14 +1343,17 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
             stroke={isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)'}
             strokeWidth={strokeW} strokeLinecap="round" />
 
-          {/* Colored gradient arc segments: red -> yellow -> green */}
+          {/* The dial's bands are the score's: red below 45, yellow 45-64,
+              green from 65 (SentimentScore.band; it shaded at 30/45/55/70).
+              Across the arc, not along it: a score's point on the arc lies
+              at (1 - cos(pi * score / 100)) / 2 of its width. */}
           <defs>
             <linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
               <stop offset="0%" stopColor={C3.error} />
-              <stop offset="30%" stopColor={C3.error} />
-              <stop offset="45%" stopColor={C3.warning} />
-              <stop offset="55%" stopColor={C3.warning} />
-              <stop offset="70%" stopColor={C3.success} />
+              <stop offset={`${dialAt(45)}%`} stopColor={C3.error} />
+              <stop offset={`${dialAt(45)}%`} stopColor={C3.warning} />
+              <stop offset={`${dialAt(65)}%`} stopColor={C3.warning} />
+              <stop offset={`${dialAt(65)}%`} stopColor={C3.success} />
               <stop offset="100%" stopColor={C3.success} />
             </linearGradient>
           </defs>
@@ -1388,7 +1412,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   const emptyStatus = { failed: failedTickers.length, unknown: unknownTickers.length, unreadable: failUnreadable && !failLimited, failure: failCause };
   // And the tickers the endpoint refuses.
   emptyStatus.unavailable = unavailableTickers.length;
-  const Sparkline = ({ data, width = 80, height = 20 }) => {
+  // `color`: the card's trend colour, the arrow's (getTrend, SentimentScore.
+  // trend). The line was coloured by its last day against its first, so
+  // AAPL had a green arrow up beside a red line.
+  const Sparkline = ({ data, width = 80, height = 20, color }) => {
     // One day is a reading, not "no data": "50 / 100 · 1d" stood next to
     // "no data". A line needs two days.
     if (data && data.length === 1) {
@@ -1416,11 +1443,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       const y = height - ((v - min) / range) * (height - 2) - 1;
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     }).join(' ');
-    const isUp = values[values.length - 1] >= values[0];
     return (
       <svg aria-hidden="true" focusable="false" width={width} height={height} style={{ display: 'block', flexShrink: 0 }}>
-        <polyline points={points} fill="none"
-          stroke={isUp ? C3.success : C3.error} strokeWidth="1.5" />
+        <polyline points={points} fill="none" data-sent-spark="true"
+          stroke={color || (isDark ? C3.textMutedDark : C3.textMutedLight)} strokeWidth="1.5" />
       </svg>
     );
   };
@@ -1504,7 +1530,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
             name was "Market Sentiment What is Market Sentiment?". */}
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
           <h1 ref={retryHeadingRef} tabIndex={-1} style={{ fontWeight: 700, fontSize: 16, margin: 0 }}>Market Sentiment</h1>
-          {window.HelpTooltip && <HelpTooltip title="Market Sentiment" text="Gauge overall market mood and per-ticker sentiment. Tracks social buzz, analyst ratings, and price momentum to help time your entries. Scored against the news tone of the 100 largest US stocks over 30 days: a typical stock reads about 55, Extreme Greed is the most positive tenth, Extreme Fear the least." isDark={isDark} />}
+          {window.HelpTooltip && <HelpTooltip title="Market Sentiment" text="Gauge overall market mood and per-ticker sentiment. Tracks social buzz, analyst ratings, and price momentum to help time your entries. Scored against the news tone of S&P 100 stocks over 30 days. A typical stock reads about 55. Almost all news tone is positive, so Fear means less positive than most large stocks, not negative news. Heavily covered names such as Apple or Tesla usually read lower: more articles, more mixed tone." isDark={isDark} zIndex={10001} />}
         </div>
         {/* Busy while the readings load: a press then joins the request on
             its way (refresh). The dot is News's sign for the same. */}
@@ -1547,7 +1573,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
               )}
               {(refusedAbove || failedTickers.length > 0) && (
                 <div style={{ marginTop: 16 }}>
-                  <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onHeld={() => setHeldAt(null)} onClick={() => { retryFocusRef.current = true; loadSentiment(!failedTickers.length); }} style={{
+                  <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onHeld={() => setHeldAt(null)} onClick={() => { RLW.acted(SENT_READS); retryFocusRef.current = true; loadSentiment(!failedTickers.length); }} style={{
                     padding: '12px 24px', background: C3.logoGradient, border: 'none',
                     borderRadius: '12px', color: 'white', fontSize: '14px', fontWeight: '600', cursor: 'pointer',
                   }} />
@@ -1557,10 +1583,19 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           ) : (
             <SentimentGauge score={overallScore} />
           )}
-          {/* Names the tickers that did not load: a failure line then. */}
-          <div data-own-fail={failedTickers.length ? 'sentiment' : undefined} style={{ fontSize: 11, opacity: 0.7, marginTop: 12 }}>
-            {window.SentimentAggregateLine(trackedTickers, sentimentData, overallScore, { failed: failedTickers, unknown: unknownTickers, unavailable: unavailableTickers })}
-          </div>
+          {/* Names the tickers that did not load: a failure line then. Only
+              then: "3 tracked tickers", marked while a Try again reloaded,
+              read to the open apps' shell as the screen naming the refusal
+              itself, and the panel went -- the gauge and Social Buzz then
+              both said the plan's refusal. */}
+          {(() => {
+            const aggregate = window.SentimentAggregateLine(trackedTickers, sentimentData, overallScore, { failed: failedTickers, unknown: unknownTickers, unavailable: unavailableTickers });
+            return (
+              <div data-own-fail={failedTickers.length && / did not load/.test(aggregate) ? 'sentiment' : undefined} style={{ fontSize: 11, opacity: 0.7, marginTop: 12 }}>
+                {aggregate}
+              </div>
+            );
+          })()}
           {/* A Refresh that failed: the last readings stay on screen, and
               this says the refresh did not load, and why. */}
           {/* A failure line (data-own-fail), with what failed (failCause):
@@ -1576,7 +1611,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           {/* Some tickers failed beside a reading: Try again asks for those
               only (the answered ones are kept). */}
           {!loading && overallScore != null && failedTickers.length > 0 && (
-            <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onHeld={() => setHeldAt(null)} onClick={() => { retryFocusRef.current = true; loadSentiment(); }} style={{
+            <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onHeld={() => setHeldAt(null)} onClick={() => { RLW.acted(SENT_READS); retryFocusRef.current = true; loadSentiment(); }} style={{
               marginTop: 10, padding: '6px 14px', borderRadius: 10, border: '1px solid ' + (isDark ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.25)'),
               background: 'none', color: isDark ? C3.textDark : C3.textLightTheme, fontSize: 13, fontWeight: 600, cursor: 'pointer',
             }} />
@@ -1814,6 +1849,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
               const sc = score !== null ? score : '--';
               const trendArrow = trend === 'up' ? '\u2191' : trend === 'down' ? '\u2193' : '\u2192';
               // Light theme: the darker inks (the dark-theme green read 2.03:1 on white).
+              // One trend, one colour: the arrow's and the sparkline's.
               const trendColor = trend === 'up' ? (isDark ? C3.success : (C3.successLight || '#047857'))
                 : trend === 'down' ? (isDark ? C3.error : (C3.errorLight || '#c81e2c'))
                 : (isDark ? C3.textMutedDark : C3.textMutedLight);
@@ -1870,7 +1906,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                     // A refusal the host's panel explains reads "not served" (Sparkline).
                     : failedTickers.indexOf(ticker) !== -1 && !refusedAbove && !(sentimentData[ticker] || []).length
                     ? <div data-sent-failed={ticker} data-own-fail="sentiment" style={{ height: 20, display: 'flex', alignItems: 'center', fontSize: 10, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>did not load</div>
-                    : <Sparkline data={sentimentData[ticker] || []} width={80} height={20} />}
+                    : <Sparkline data={sentimentData[ticker] || []} width={80} height={20} color={trendColor} />}
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 }}>
                     <span title={(sentimentData[ticker] || []).length ? `Average over ${(sentimentData[ticker] || []).length} days with news, weighted by mentions` : undefined}
                       style={{ fontSize: 18, fontWeight: 700, color: scoreColor(score) }}>{sc}{score != null && <span style={{ fontSize: 10, fontWeight: 500 }}>/100{(sentimentData[ticker] || []).length ? ` · ${(sentimentData[ticker] || []).length}d` : ''}</span>}</span>
@@ -1880,22 +1916,26 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                         aria-label={trend === 'up' ? 'trending up' : trend === 'down' ? 'trending down' : 'flat'}>{trendArrow}</span>
                     )}
                   </div>
-                  {/* Positive / Negative / Neutral counts */}
+                  {/* The days on the score's scale: Greed or
+                      higher in the score's green, Fear or lower in its red. */}
                   {sentimentData[ticker] && sentimentData[ticker].length > 0 && (
                     <div style={{ display: 'flex', gap: 6, marginTop: 6, minWidth: 0 }}>
                       {(() => {
-                        const b = window.SentimentDays.bands(sentimentData[ticker]);
-                        const desc = `${b.strong} strongly positive (tone 0.7 or more), ${b.positive} positive (0.3 to 0.7), ${b.neutral} neutral (-0.3 to 0.3), ${b.negative} negative (below -0.3) days`;
-                        const pos = (c) => isDark ? (window.A11yColor ? window.A11yColor.text(c, true) : c) : (C3.successLight || '#047857');
+                        const SD = window.SentimentDays;
+                        const c = SD.bands(sentimentData[ticker]);
+                        const l = SD.line(c);
+                        const desc = SD.describe(c);
+                        // The score's own inks (Greed 65+, Fear below 45); on
+                        // the dark theme lifted for 10 px text, as before.
+                        const ink = (s) => (isDark && window.A11yColor
+                          ? window.A11yColor.text(window.SentimentScore.color(s, true, true), true)
+                          : window.SentimentScore.color(s, isDark));
                         return (
-                          // Wraps inside its card: on a 320 px phone "19++ 11+ 0~ 0- days"
-                          // was wider than the card.
-                          <span title={desc} aria-label={desc} style={{ display: 'flex', flexWrap: 'wrap', columnGap: 6, rowGap: 2, minWidth: 0 }}>
-                            <span style={{ fontSize: 10, color: pos(C3.success) }}>{b.strong}++</span>
-                            <span style={{ fontSize: 10, color: pos(C3.success) }}>{b.positive}+</span>
-                            <span style={{ fontSize: 10, opacity: 0.7 }}>{b.neutral}~</span>
-                            <span style={{ fontSize: 10, color: isDark ? (window.A11yColor ? window.A11yColor.text(C3.error, true) : C3.error) : (C3.errorLight || '#c81e2c') }}>{b.negative}-</span>
-                            <span style={{ fontSize: 10, opacity: 0.7 }}>days</span>
+                          // Wraps inside its card: on a 320 px phone the
+                          // counts were wider than the card.
+                          <span title={desc} aria-label={desc} style={{ display: 'flex', flexWrap: 'wrap', columnGap: 4, rowGap: 2, minWidth: 0 }}>
+                            <span style={{ fontSize: 10, color: ink(65) }}>{l.upText}</span>
+                            <span style={{ fontSize: 10, color: ink(44) }}>{l.downText}</span>
                           </span>
                         );
                       })()}

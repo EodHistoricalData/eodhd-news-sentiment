@@ -167,6 +167,8 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
   // it names the limit; it said "Try again in a moment" with no number.
   const RLW = window.RateLimitWait;
   const rlWait = RLW.useWait();
+  // The name the feed's repeat after a 429 is paced and budgeted by.
+  const NEWS_FEED = 'news-feed';
   // The limit is named only when it is why the feed failed (a 500 stays
   // "did not answer"); the button counts any wait down.
   const newsLimited = RLW.useCause(error);
@@ -396,7 +398,9 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
       if (!(cached && cached.items && cached.items.length)) {
         setNews(null);
         setRefused(Boolean(window.Entitlement && window.Entitlement.explained && window.Entitlement.explained()));
-        setErrorFail(keptFail);
+        // With the chip it was for: the repeat after a 429 is of that feed,
+        // never of another chip picked since.
+        setErrorFail(Object.assign({}, keptFail, { asked: category }));
         if (!(window.Entitlement && window.Entitlement.explained())) setError(NOT_SERVED);
         // The network came back while this request was still failing: the
         // 'online' event has passed, so the retry is here,
@@ -456,6 +460,17 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
   };
   const reconnectRef = React.useRef(reconnect);
   reconnectRef.current = reconnect;
+  // A feed the limit stopped (429), with nothing on screen: asked once more
+  // by itself when the wait is over, as every other panel is (RateLimitWait.
+  // useReloadAfterWait); only Try again asked it.
+  // If that repeat meets the limit again, Try again keeps counting
+  // the wait down and nothing is sent until it is pressed or the screen is
+  // opened again. A refresh that failed beside headlines has its own line
+  // and repeat (FailNote "news-refresh").
+  RLW.useReloadAfterWait(error === NOT_SERVED && errorFail && errorFail.limited ? errorFail : null, () => {
+    if (RLW.focusOnRetry()) retryFocusRef.current = true;
+    loadNews();
+  }, NEWS_FEED, { asked: category });
   React.useEffect(() => {
     const up = () => { onlineAtRef.current = Date.now(); reconnectRef.current(); };
     window.addEventListener('online', up);
@@ -734,7 +749,7 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
                 {/* No Try again for a plan's refusal (403), nor
                     under a host's panel for the key or the day. */}
                 {!(error === NOT_SERVED && !newsLimited && errorFail && !errorFail.limited && (errorFail.status === 403 || RLW.hostSaysKey(errorFail))) && (
-                  <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onClick={() => { retryFocusRef.current = true; loadNews(); }} style={{
+                  <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onClick={() => { RLW.acted(NEWS_FEED); retryFocusRef.current = true; loadNews(); }} style={{
                     marginTop: '16px', color: C3.glowOrange, background: 'transparent',
                     border: 'none', cursor: 'pointer', fontWeight: '600',
                   }} />
