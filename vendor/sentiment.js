@@ -1,5 +1,5 @@
 // Sentiment Module — Market Sentiment Analysis View
-// Full-screen view with gauge, per-ticker sentiment, social buzz, and news breakdown
+// Full-screen view with gauge, per-ticker sentiment, news mentions, and news breakdown
 
 // A ticker's days by news tone, on the score's own scale. A +/-0.1 cut put
 // every day of AAPL, MSFT and NVDA in "+" (p.25); fixed bands on
@@ -13,15 +13,20 @@ window.SentimentDays = {
   bands(items) {
     return window.SentimentScore.dayCounts(items);
   },
-  // The card's line, short: the days Greed or higher and Fear or lower.
+  // The card's line, short: the days on the Greed side (Greed and Extreme
+  // Greed) and on the Fear side. Each half fits one line of a 320 px
+  // card, so the line is two at most: "7 days Greed or higher," was wider
+  // than the card and broke into three, "higher," alone on the second.
   line(c) {
     const up = c['Extreme Greed'] + c.Greed;
     const down = c.Fear + c['Extreme Fear'];
-    return { up, down, upText: `${up} day${up === 1 ? '' : 's'} Greed or higher,`, downText: `${down} Fear or lower` };
+    const days = (n) => (n === 1 ? 'day' : 'days');
+    return { up, down, upText: `${up} Greed ${days(up)},`, downText: `${down} Fear ${days(down)}` };
   },
-  // Its tooltip and accessible name: every label.
+  // Its tooltip and accessible name: every label, and what the line's two
+  // counts take in.
   describe(c) {
-    return `Days by their news tone, scored as the number above is: ${c['Extreme Greed']} Extreme Greed, ${c.Greed} Greed, ${c.Neutral} Neutral, ${c.Fear} Fear, ${c['Extreme Fear']} Extreme Fear.`;
+    return `Days by their news tone, scored as the number above is: ${c['Extreme Greed']} Extreme Greed, ${c.Greed} Greed, ${c.Neutral} Neutral, ${c.Fear} Fear, ${c['Extreme Fear']} Extreme Fear. Greed days include Extreme Greed, Fear days Extreme Fear.`;
   },
 };
 
@@ -281,19 +286,25 @@ window.SentimentAggregateLine = (tracked, data, score, status) => {
   const word = (k) => `${k} tracked ticker${k === 1 ? '' : 's'}`;
   if (!n) return 'No tracked tickers — add one below';
   if (score == null) return word(n);
-  const used = tracked.filter((t) => ((data || {})[t] || []).length > 0).length;
+  // A ticker with too little news (SentimentScore.enoughNews) is not in the
+  // reading, and is named: it has data, but no score.
+  const has = (t) => ((data || {})[t] || []).length > 0;
+  const enough = (t) => !window.SentimentScore || !window.SentimentScore.enoughNews || window.SentimentScore.enoughNews((data || {})[t]);
+  const used = tracked.filter((t) => has(t) && enough(t)).length;
   if (used === n) return `Aggregated from ${word(n)}, weighted by mentions`;
   const mine = (list) => (list || []).filter((t) => tracked.indexOf(t) !== -1 && !((data || {})[t] || []).length);
   const names = (list) => list.map((t) => window.SentimentTickerLabel(t, tracked)).join(', ');
   const failed = mine(status && status.failed);
   const unknown = mine(status && status.unknown).filter((t) => failed.indexOf(t) === -1);
   const unavailable = mine(status && status.unavailable).filter((t) => failed.indexOf(t) === -1 && unknown.indexOf(t) === -1);
-  if (!failed.length && !unknown.length && !unavailable.length) return `Aggregated from ${used} of ${word(n)} (no data for the rest), weighted by mentions`;
+  const thin = tracked.filter((t) => has(t) && !enough(t));
+  if (!failed.length && !unknown.length && !unavailable.length && !thin.length) return `Aggregated from ${used} of ${word(n)} (no data for the rest), weighted by mentions`;
   const notes = [];
   if (failed.length) notes.push(`${names(failed)} did not load`);
   if (unknown.length) notes.push(`not found on EODHD: ${names(unknown)}`);
   if (unavailable.length) notes.push(`not available for ${names(unavailable)}`);
-  if (n - used - failed.length - unknown.length - unavailable.length > 0) notes.push('no data for the rest');
+  if (thin.length) notes.push(`not enough news for ${names(thin)}`);
+  if (n - used - failed.length - unknown.length - unavailable.length - thin.length > 0) notes.push('no data for the rest');
   return `Aggregated from ${used} of ${word(n)}, weighted by mentions (${notes.join('; ')})`;
 };
 
@@ -346,6 +357,9 @@ window.SentimentEmptyNote = (kind, trackedCount, refused, notServed, status) => 
 };
 
 window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTabChange, onSettingsClick }) => {
+  // Drawn again when a host's panel comes or goes: a line that points to
+  // it is drawn only while it is up (RateLimitWait.hostSaysKey, panelUp).
+  ((window.RateLimitWait && window.RateLimitWait.useHostPanel) || (() => {}))();
   const C3 = window.C3;
   const isDark = theme === 'dark';
   const isDemo = window.EODHD_API.isDemo(apiKey);
@@ -536,6 +550,13 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     // the panel shut or open on another text.
     setSearchLimit(null);
   };
+  // Escape with the list open: the search still out is over -- its late
+  // answer opens no list, and its failure is said by nobody.
+  const dropSearch = () => {
+    searchSeqRef.current++;
+    inFlightRef.current = null;
+    setSearchLoading(false);
+  };
   const closeAddPanel = () => {
     endSearch();
     setShowSearch(false); setSearchQuery(''); setSearchResults([]); setActiveResult(-1);
@@ -544,6 +565,8 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   // With the focus elsewhere, Escape closes the open panel as a layer.
   (window.useEscLayer || (() => {}))(showSearch, closeAddPanel);
   const [addNote, setAddNote] = React.useState(null);
+  // The line as drawn now (a failure's words follow the host's panel).
+  const addNoteText = window.SymbolCode.words(addNote);
   // The ticker + Add put on the list, until its first read says whether the
   // endpoint takes it.
   const justAddedRef = React.useRef(null);
@@ -628,6 +651,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     return SC && SC.searchFailNote ? SC.searchFailNote(err || {}, 0, 'Press Enter to try again.')
       : 'The ticker search did not load: EODHD did not answer, or the connection dropped. Press Enter to try again.';
   };
+  // The search's failure, kept as how to say it and worded when drawn
+  // (SymbolCode.late): a refused key points to the panel only while it is up.
+  const sayFailed = (kind, err) => setAddNote(window.SymbolCode.late(() => searchFailNote(kind, err)));
   // The limit's line: the search's words, or the bare limit for what Enter
   // asked (a typed code's check), as Backtester's picker says them.
   const limitWords = (search) => {
@@ -636,6 +662,8 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     return search ? (SC && SC.SEARCH_LIMIT_WORDS) || 'The ticker search did not load: ' + words : words;
   };
   const searchSeqRef = React.useRef(0);
+  // The search's turn is over when the view goes (SymbolCode.useSearchTurns).
+  React.useEffect(() => () => { searchSeqRef.current++; }, []);
   const [searchTry, setSearchTry] = React.useState(0);
   // The limit stopped the search for this text: { failure, query, redo }.
   // Once the wait is over the search is asked again by itself for the text
@@ -751,10 +779,14 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     const again = () => takePick(pick, query, rows);
     if (addWait.hold()) { setAddNote(limitWords(false)); limitedSearch(query, again); return; }
     const SC = window.SymbolCode;
-    const api = SC.apiFor(window.EODHD_API, apiKey);
     const gen = pickGenRef.current;
+    // Over once the field changed (its turn, searchSeqRef), Escape or
+    // another pick: dropped, and said by nobody (apiFor's idle).
+    const turn = searchSeqRef.current;
+    const over = () => turn !== searchSeqRef.current || gen !== pickGenRef.current || searchNowRef.current !== query;
+    const api = SC.apiFor(window.EODHD_API, apiKey, { idle: over });
     Promise.resolve(SC.listed(pick.check, api)).then((ok) => {
-      if (searchNowRef.current !== query || gen !== pickGenRef.current) return;
+      if (over()) return;
       if (ok === true) {
         const d = pick.check.lastIndexOf('.');
         addTicker((SC.listedRow && SC.listedRow(pick.check)) || { Code: pick.check.slice(0, d), Exchange: pick.check.slice(d + 1), Name: '' });
@@ -764,7 +796,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       // made again once the wait is over.
       } else if (ok === 'limited') { setAddNote(limitWords(false)); limitedSearch(query, again); }
       // Nothing known (a 500, no connection): said as such, and Enter asks again.
-      else if (ok && ok.failed !== undefined) setAddNote(SC.failNote(query, ok.failed, ok.unreadable));
+      else if (ok && ok.failed !== undefined) setAddNote(SC.late(() => SC.failNote(query, ok.failed, ok.unreadable)));
       else setAddNote(SC.noneNote(query));
     });
   };
@@ -826,6 +858,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       // says why.
       const held = Date.now() < searchLimitedUntilRef.current ? 'limited' : (searchRefusedRef.current ? 'refused' : null);
       if (held) {
+        // Nothing is sent, so nothing is loading: a search for the text
+        // before ("NVD"), dropped when it met the limit, left its spinner
+        // for this one to end, and it turned on under the limit's line.
+        setSearchLoading(false);
         if (inFlightRef.current === searchQuery) inFlightRef.current = null;
         // An Enter kept for this text waits for the search after the wait
         // and takes its row then.
@@ -834,7 +870,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         resultsQueryRef.current = searchQuery;
         resultsRowsRef.current = [];
         setSearchResults([]);
-        setAddNote(searchFailNote(held, held === 'refused' ? searchRefusedRef.current : null));
+        sayFailed(held, held === 'refused' ? searchRefusedRef.current : null);
         setDownFor(null);
         endRetryBusy(false);
         if (held === 'limited') limitedSearch(searchQuery);
@@ -872,7 +908,13 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         let stopWait = null;
         // The code alone for Yahoo's suffix: search/VOD.L answers nothing,
         // search/VOD answers VOD.LSE (window.SymbolCode.searchText).
-        const ask = window.EODHD_API.searchStocks(apiKey, window.SymbolCode.searchText(searchQuery) || searchQuery, { throwErrors: true });
+        // `idle`: a search the typing has moved past, or a closed panel, is
+        // used by nobody, and the open apps' shell says its failure nowhere
+        // (the panel above said a superseded search's limit over the cards).
+        // The terminal's client ignores the option.
+        // reportsFailure: its failure is this field's line, not the panel's
+        // too; idle once its turn is over (SymbolCode.searchTurns().ask).
+        const ask = window.EODHD_API.searchStocks(apiKey, window.SymbolCode.searchText(searchQuery) || searchQuery, { throwErrors: true, reportsFailure: true, idle: () => !latest() });
         Promise.resolve(ask).catch(() => {});
         const data = await Promise.race([ask, new Promise((_, fail) => {
           stopWait = window.SymbolCode.searchDeadline(window.SentimentSearchWait.ANSWER_MS,
@@ -900,7 +942,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         // At the limit an Enter kept for this text is kept for the search
         // after the wait, as above.
         if (kind !== 'limited') pendingEnterRef.current = null;
-        setAddNote(searchFailNote(kind, e));
+        // Worded when drawn: a refused key points to the panel only while
+        // it is up (SymbolCode.late).
+        sayFailed(kind, e);
         setDownFor(kind === 'down' || kind === 'timeout' ? searchQuery : null);
         endRetryBusy(false);
         if (kind === 'limited') limitedSearch(searchQuery); else setSearchLimit(null);
@@ -919,8 +963,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     let sum = 0;
     let weight = 0;
     (items || []).forEach(d => {
-      const n = Number(d && d.normalized);
-      if (!Number.isFinite(n)) return;
+      // A day without a tone is left out (SentimentScore.toneOf), not read as 0.
+      const n = d ? window.SentimentScore.toneOf(d.normalized) : null;
+      if (n == null) return;
       const w = Math.max(1, Number(d.count) || 0);
       sum += n * w;
       weight += w;
@@ -1071,7 +1116,9 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
       // across tickers, read against the tone of large US stocks
       // (SentimentScore.scale, 0-100). Null when nothing came back -- a gauge
       // has to be allowed to say "no reading".
-      const avg = weightedNormalized(Object.values(results).flat());
+      // A ticker with too little news (SentimentScore.enoughNews) is left
+      // out, as its card shows no score.
+      const avg = weightedNormalized(Object.values(results).filter((items) => window.SentimentScore.enoughNews(items)).flat());
       setOverallScore(window.SentimentScore.scale(avg));
     } catch (e) {
       if (reqId !== sentimentReqRef.current) return;
@@ -1227,7 +1274,15 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   const getTickerScore = (ticker) => {
     const items = sentimentData[ticker];
     if (!items || items.length === 0) return null;
-    return window.SentimentScore.scale(weightedNormalized(items));
+    // Too little news to score (the widget's rule): no number. The page's
+    // reading (SentimentScore.reading), which discovery reads too.
+    const r = window.SentimentScore.reading(items);
+    return r ? r.score : null;
+  };
+  // Data, but too little news for a score (SentimentScore.enoughNews).
+  const thinNews = (ticker) => {
+    const items = sentimentData[ticker];
+    return !!(items && items.length) && !window.SentimentScore.enoughNews(items);
   };
 
   // --- Helper: sentiment trend direction ---
@@ -1251,7 +1306,10 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
   // --- Helper: label for overall score ---
   const getLabel = (score) => window.SentimentScore.label(score) || 'No reading';
 
-  // --- Social buzz: count mentions from sentimentData ---
+  // --- News mentions: how many news articles mentioned each ticker ---
+  // EODHD's sentiment rows count news articles a day (`count`); nothing here
+  // comes from social media, though the section was called "Social Buzz"
+  // with a "Buzz: 1.5x avg" line for a field the answer does not carry.
   // Only tickers a reading came back for. A refused or empty answer used to
   // rank as "#1 AAPL 0 mentions", a zero shown as if counted, right under
   // "No sentiment reading".
@@ -1259,10 +1317,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     const buzz = trackedTickers.filter(ticker => (sentimentData[ticker] || []).length > 0).map(ticker => {
       const items = sentimentData[ticker] || [];
       const totalCount = items.reduce((s, d) => s + (d.count || 0), 0);
-      const avgBuzz = items.length > 0
-        ? items.reduce((s, d) => s + (d.buzz?.buzz || 0), 0) / items.length
-        : 0;
-      return { ticker, count: totalCount, buzz: avgBuzz };
+      return { ticker, count: totalCount };
     });
     buzz.sort((a, b) => b.count - a.count);
     return buzz;
@@ -1434,7 +1489,16 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
     // Oldest on the left. /sentiments answers newest first, and the line was
     // drawn in that order: time ran right to left, a rising tone fell and
     // was coloured red, beside the trend arrow pointing up.
-    const values = window.SentimentScore.chronological(data).map(d => (d.normalized || 0));
+    // Days without a tone are not points: a gap read as 0 drew a dip.
+    const values = window.SentimentScore.chronological(data)
+      .map(d => window.SentimentScore.toneOf(d && d.normalized)).filter(v => v != null);
+    if (values.length < 2) {
+      return <div style={{ width, height, display: 'flex', alignItems: 'center' }}>
+        <span style={{ fontSize: 10, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>
+          {values.length === 1 ? '1 day with a tone' : 'no tone'}
+        </span>
+      </div>;
+    }
     const min = Math.min(...values);
     const max = Math.max(...values);
     const range = max - min || 1;
@@ -1530,7 +1594,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
             name was "Market Sentiment What is Market Sentiment?". */}
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
           <h1 ref={retryHeadingRef} tabIndex={-1} style={{ fontWeight: 700, fontSize: 16, margin: 0 }}>Market Sentiment</h1>
-          {window.HelpTooltip && <HelpTooltip title="Market Sentiment" text="Gauge overall market mood and per-ticker sentiment. Tracks social buzz, analyst ratings, and price momentum to help time your entries. Scored against the news tone of S&P 100 stocks over 30 days. A typical stock reads about 55. Almost all news tone is positive, so Fear means less positive than most large stocks, not negative news. Heavily covered names such as Apple or Tesla usually read lower: more articles, more mixed tone." isDark={isDark} zIndex={10001} />}
+          {window.HelpTooltip && <HelpTooltip title="Market Sentiment" text="Gauge overall market mood and per-ticker sentiment from the news. Scored against the news tone of S&P 100 stocks over 30 days. A typical stock reads about 55. Almost all news tone is positive, so Fear means less positive than most large stocks, not negative news. Heavily covered names such as Apple or Tesla usually read lower: more articles, more mixed tone." isDark={isDark} zIndex={10001} />}
         </div>
         {/* Busy while the readings load: a press then joins the request on
             its way (refresh). The dot is News's sign for the same. */}
@@ -1586,7 +1650,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           {/* Names the tickers that did not load: a failure line then. Only
               then: "3 tracked tickers", marked while a Try again reloaded,
               read to the open apps' shell as the screen naming the refusal
-              itself, and the panel went -- the gauge and Social Buzz then
+              itself, and the panel went -- the gauge and News Mentions then
               both said the plan's refusal. */}
           {(() => {
             const aggregate = window.SentimentAggregateLine(trackedTickers, sentimentData, overallScore, { failed: failedTickers, unknown: unknownTickers, unavailable: unavailableTickers });
@@ -1642,13 +1706,13 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           </button>
         </div>
         {/* Always there, so a reader hears a line when it appears. */}
-        <div role="status" aria-live="polite" data-sent-add-note={addNote ? 'true' : undefined} data-own-fail="search" data-see-panel={RLW.seesPanel(addNote)}
-             style={addNote ? { fontSize: 11, marginBottom: 8, color: isDark ? C3.textMutedDark : C3.textMutedLight, overflowWrap: 'anywhere' } : undefined}>{addNote || ''}</div>
+        <div role="status" aria-live="polite" data-sent-add-note={addNoteText ? 'true' : undefined} data-own-fail="search" data-see-panel={RLW.seesPanel(addNoteText)}
+             style={addNoteText ? { fontSize: 11, marginBottom: 8, color: isDark ? C3.textMutedDark : C3.textMutedLight, overflowWrap: 'anywhere' } : undefined}>{addNoteText || ''}</div>
         {/* At the limit, as the shared picker draws it (PortalDropdown,
             RetryAfterWait): Try again counting the wait down, outside the
             line's live region, and the note of an Enter or a press it held.
             There was neither. */}
-        {showSearch && searchLimit && addNote && (
+        {showSearch && searchLimit && addNoteText && (
           <div data-search-wait="true" style={{ marginBottom: 8 }}>
             <RLW.RetryButton wait={addWait} noteHere={false} isDark={isDark} data-retry-focus="true" onClick={searchAgain} style={{
               padding: '4px 12px', minHeight: 32, borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 600,
@@ -1661,7 +1725,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           </div>
         )}
         {/* The search did not answer: Try again asks it again (downFor). */}
-        {showSearch && !searchLimit && addNote && downFor != null && downFor === searchQuery && (
+        {showSearch && !searchLimit && addNoteText && downFor != null && downFor === searchQuery && (
           <div data-search-retry="true" style={{ marginBottom: 8 }}>
             <RLW.RetryButton isDark={isDark} busyKey={RETRY_KEY} data-retry-focus="true" onClick={retrySearch} style={{
               padding: '4px 12px', minHeight: 32, borderRadius: 6, cursor: 'pointer', fontSize: 12, fontWeight: 600,
@@ -1713,7 +1777,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                 if (e.key === 'Escape') {
                   e.preventDefault();
                   pendingEnterRef.current = null;
-                  if (shown.length) { setActiveResult(-1); setSearchResults([]); }
+                  if (shown.length) { setActiveResult(-1); setSearchResults([]); dropSearch(); }
                   else closeAddPanel();
                   return;
                 }
@@ -1748,7 +1812,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                       const kind = searchFailedRef.current;
                       if (kind === 'limited' && Date.now() < searchLimitedUntilRef.current) { holdEnter(); return; }
                       if (kind === 'refused') {
-                        setAddNote(searchFailNote(kind, searchRefusedRef.current));
+                        sayFailed(kind, searchRefusedRef.current);
                         return;
                       }
                       setAddNote(null);
@@ -1833,7 +1897,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
         <window.PaywallGate
           allowed={!isDemo}
           type="subscription"
-          message="See per-ticker sentiment, trend tracking and social buzz metrics with a data subscription."
+          message="See per-ticker sentiment, trend tracking and news mention counts with a data subscription."
           actionLabel="Upgrade Plan"
           onAction={() => { if (onSettingsClick) onSettingsClick(); }}
           isDark={isDark}
@@ -1874,7 +1938,7 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                   {/* For the keyboard and for assistive technology; the mouse
                       goes through it to the card (and to the titles on it). */}
                   <button type="button" aria-pressed={isSelected} data-sent-card={ticker}
-                    aria-label={unavailableTickers.indexOf(ticker) !== -1 ? `${tickerLabel}: sentiment data is not available` : unknownTickers.indexOf(ticker) !== -1 ? `${tickerLabel}: not found on EODHD` : failedTickers.indexOf(ticker) !== -1 && !refusedAbove && !(sentimentData[ticker] || []).length ? `${tickerLabel}: did not load` : `${tickerLabel} sentiment${score != null ? ' ' + score + ' of 100' : ''}`}
+                    aria-label={unavailableTickers.indexOf(ticker) !== -1 ? `${tickerLabel}: sentiment data is not available` : unknownTickers.indexOf(ticker) !== -1 ? `${tickerLabel}: not found on EODHD` : failedTickers.indexOf(ticker) !== -1 && !refusedAbove && !(sentimentData[ticker] || []).length ? `${tickerLabel}: did not load` : !isDemo && thinNews(ticker) ? `${tickerLabel}: not enough news to score` : `${tickerLabel} sentiment${score != null ? ' ' + score + ' of 100' : ''}`}
                     onClick={(e) => { e.stopPropagation(); setSelectedTicker(isSelected ? null : ticker); }}
                     style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', background: 'none', border: 'none', padding: 0, margin: 0, borderRadius: 'inherit', pointerEvents: 'none' }} />
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
@@ -1906,19 +1970,24 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                     // A refusal the host's panel explains reads "not served" (Sparkline).
                     : failedTickers.indexOf(ticker) !== -1 && !refusedAbove && !(sentimentData[ticker] || []).length
                     ? <div data-sent-failed={ticker} data-own-fail="sentiment" style={{ height: 20, display: 'flex', alignItems: 'center', fontSize: 10, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>did not load</div>
+                    // Too little news to score, the dashboard widget's rule
+                    // (SentimentScore.enoughNews): said, not a number.
+                    : !isDemo && thinNews(ticker)
+                    ? <div data-sent-thin={ticker} title={`Fewer than ${window.SentimentScore.MIN_MENTIONS} mentions in the last ${window.SentimentScore.WINDOW_DAYS} days: too few to score`}
+                        style={{ height: 20, display: 'flex', alignItems: 'center', fontSize: 10, color: isDark ? C3.textMutedDark : C3.textMutedLight }}>not enough news</div>
                     : <Sparkline data={sentimentData[ticker] || []} width={80} height={20} color={trendColor} />}
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 }}>
                     <span title={(sentimentData[ticker] || []).length ? `Average over ${(sentimentData[ticker] || []).length} days with news, weighted by mentions` : undefined}
                       style={{ fontSize: 18, fontWeight: 700, color: scoreColor(score) }}>{sc}{score != null && <span style={{ fontSize: 10, fontWeight: 500 }}>/100{(sentimentData[ticker] || []).length ? ` · ${(sentimentData[ticker] || []).length}d` : ''}</span>}</span>
                     {/* No trend without data: a flat arrow over "no data" read as "unchanged". */}
-                    {(isDemo || (sentimentData[ticker] && sentimentData[ticker].length >= 2)) && (
+                    {(isDemo || (sentimentData[ticker] && sentimentData[ticker].length >= 2 && !thinNews(ticker))) && (
                       <span style={{ fontSize: 16, fontWeight: 700, color: trendColor }}
                         aria-label={trend === 'up' ? 'trending up' : trend === 'down' ? 'trending down' : 'flat'}>{trendArrow}</span>
                     )}
                   </div>
                   {/* The days on the score's scale: Greed or
                       higher in the score's green, Fear or lower in its red. */}
-                  {sentimentData[ticker] && sentimentData[ticker].length > 0 && (
+                  {sentimentData[ticker] && sentimentData[ticker].length > 0 && !thinNews(ticker) && (
                     <div style={{ display: 'flex', gap: 6, marginTop: 6, minWidth: 0 }}>
                       {(() => {
                         const SD = window.SentimentDays;
@@ -1947,22 +2016,22 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
           </div>
         </window.PaywallGate>
 
-        {/* ============= SOCIAL BUZZ ============= */}
+        {/* ============= NEWS MENTIONS ============= */}
         {/* With nothing tracked there is nothing to count: the section stood
             empty under "No tracked tickers". */}
         {trackedTickers.length > 0 && (<>
-        <h2 style={{ fontSize: 14, fontWeight: 700, marginTop: 16, marginBottom: 8 }}>Social Buzz</h2>
+        <h2 style={{ fontSize: 14, fontWeight: 700, marginTop: 16, marginBottom: 8 }}>News Mentions</h2>
         <window.PaywallGate
           allowed={!isDemo}
           type="subscription"
-          message="Social buzz analysis requires a data subscription."
+          message="News mention counts require a data subscription."
           actionLabel="Upgrade Plan"
           onAction={() => { if (onSettingsClick) onSettingsClick(); }}
           isDark={isDark}
           style={{ marginBottom: 12 }}
         >
           <div style={cardStyle}>
-            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, opacity: 0.7 }}>Trending Tickers (by mention count)</div>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 10, opacity: 0.7 }}>Tracked tickers by the news articles that mentioned them, last 30 days of data</div>
             {buzzData.map((b, i) => {
               const pct = (b.count / maxBuzzCount) * 100;
               const tickerLabel = window.SentimentTickerLabel(b.ticker, trackedTickers);
@@ -1987,11 +2056,6 @@ window.SentimentView = ({ apiKey, theme, onClose, onSelectAsset, activeTab, onTa
                       transition: 'width 0.5s ease',
                     }} />
                   </div>
-                  {b.buzz > 0 && (
-                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>
-                      Buzz: {b.buzz.toFixed(1)}x avg
-                    </div>
-                  )}
                 </div>
               );
             })}

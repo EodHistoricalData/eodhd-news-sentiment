@@ -18,6 +18,23 @@
   if (typeof window === 'undefined' || window.SentimentScore) return;
 
   const MIN_MENTIONS = 3;
+
+  // A day's tone as a number, or null when the day has none: a finite JSON
+  // number, or a string that is one plain decimal number. null, a missing
+  // field, '', 'NA', true/false and anything else are no tone, and the day is
+  // left out of every reading -- Number(null) read 0, so a day without a tone
+  // counted as a neutral one here while the terminal's server (tone_of) left it out,
+  // and the two disagreed on "enough news" and on the score. One table of
+  // cases is read by both.
+  const TONE_TEXT = /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/;
+  function toneOf(v) {
+    if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+    if (typeof v === 'string' && TONE_TEXT.test(v)) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  }
   const WINDOW_DAYS = 14;
 
   // The 0-100 scale: EODHD's mention-weighted tone (-1..1) against the tone of
@@ -84,9 +101,14 @@
   // Extreme Greed); null for no number. The page coloured at 35/65 and the
   // widget at 40/60, so one number was red in one place and yellow in the
   // other.
+  // Where the bands start (Greed and up, Fear and down): the same numbers in
+  // the terminal's server (SENTIMENT_BAND_POS, SENTIMENT_BAND_NEG_BELOW), which
+  // discovery's bullish and bearish follow.
+  const BAND_POS = 65;
+  const BAND_NEG_BELOW = 45;
   function band(score) {
     if (typeof score !== 'number' || !Number.isFinite(score)) return null;
-    return score >= 65 ? 'pos' : score >= 45 ? 'neutral' : 'neg';
+    return score >= BAND_POS ? 'pos' : score >= BAND_NEG_BELOW ? 'neutral' : 'neg';
   }
 
   // The page's inks for a band (window.C3): the bright ones on the dark
@@ -110,9 +132,9 @@
     const out = {};
     LABELS.forEach((l) => { out[l[1]] = 0; });
     (rows || []).forEach((d) => {
-      const v = d ? d.normalized : null;
-      if (v == null || v === '') return;
-      const l = label(scale(Number(v)));
+      const v = toneOf(d ? d.normalized : null);
+      if (v == null) return;
+      const l = label(scale(v));
       if (l) out[l]++;
     });
     return out;
@@ -191,8 +213,8 @@
     let dayCount = 0;
     (rows || []).forEach((d) => {
       if (!d || String(d.date || '').slice(0, 10) < cutoff) return;
-      const n = Number(d.normalized);
-      if (!Number.isFinite(n)) return;
+      const n = toneOf(d.normalized);
+      if (n == null) return;
       const w = Math.max(1, Number(d.count) || 0);
       sum += n * w;
       weight += w;
@@ -206,8 +228,38 @@
     };
   }
 
+  // Whether a ticker has news enough to be scored: MIN_MENTIONS mentions in
+  // the last WINDOW_DAYS days, the dashboard widget's rule (summarize). One
+  // rule for every place that shows a score -- the widget, the Sentiment page,
+  // the EODHD Score's sentiment part (the terminal's server, enough_news) and
+  // discovery: below it each says "not enough news" instead of a number. The
+  // page read M&M.NSE 99/100, Extreme Greed, from 4 articles while the widget
+  // had it among those "without enough news".
+  function enoughNews(rows, opts) { return summarize(rows, opts) != null; }
+
+  // A ticker's reading as the Sentiment page shows it: its PAGE_DAYS newest
+  // days, mention-weighted, days without a tone left out, on scale() --
+  // { score, tone }, or null without news enough to score (enoughNews).
+  // The terminal's server sentiment_reading is the same reading (discovery's bullish
+  // and bearish), held equal by the tests.
+  function reading(rows, opts) {
+    const days = latest(rows, PAGE_DAYS);
+    if (!enoughNews(days, opts)) return null;
+    let sum = 0;
+    let weight = 0;
+    days.forEach((d) => {
+      const n = d ? toneOf(d.normalized) : null;
+      if (n == null) return;
+      const w = Math.max(1, Number(d.count) || 0);
+      sum += n * w;
+      weight += w;
+    });
+    if (!weight) return null;
+    return { score: scale(sum / weight), tone: sum / weight };
+  }
+
   window.SentimentScore = {
-    codeFor, rowsFor, summarize, scale, TONE_ANCHORS, trend, chronological, MIN_MENTIONS, WINDOW_DAYS,
-    LABELS, label, band, color, dayCounts, latest, PAGE_DAYS,
+    codeFor, rowsFor, summarize, enoughNews, scale, TONE_ANCHORS, trend, chronological, MIN_MENTIONS, WINDOW_DAYS,
+    LABELS, label, band, color, dayCounts, latest, PAGE_DAYS, toneOf, BAND_POS, BAND_NEG_BELOW, reading,
   };
 })();

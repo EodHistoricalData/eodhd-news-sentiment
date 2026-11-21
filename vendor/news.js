@@ -167,6 +167,9 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
   // it names the limit; it said "Try again in a moment" with no number.
   const RLW = window.RateLimitWait;
   const rlWait = RLW.useWait();
+  // Drawn again when a host's panel comes or goes: the line that points to
+  // it follows it (RateLimitWait.panelUp).
+  RLW.useHostPanel();
   // The name the feed's repeat after a 429 is paced and budgeted by.
   const NEWS_FEED = 'news-feed';
   // The limit is named only when it is why the feed failed (a 500 stays
@@ -467,7 +470,12 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
   // the wait down and nothing is sent until it is pressed or the screen is
   // opened again. A refresh that failed beside headlines has its own line
   // and repeat (FailNote "news-refresh").
-  RLW.useReloadAfterWait(error === NOT_SERVED && errorFail && errorFail.limited ? errorFail : null, () => {
+  // The feed failed with nothing on screen whichever line says it: the open
+  // apps silence the line above while their panel explains the failure
+  // (`refused`), and the repeat hung on that line -- a 429 under the panel
+  // was asked once in 60 s, never again by itself.
+  const feedDown = (error === NOT_SERVED || (refused && !error)) && !(news && news.length);
+  RLW.useReloadAfterWait(feedDown && errorFail && errorFail.limited ? errorFail : null, () => {
     if (RLW.focusOnRetry()) retryFocusRef.current = true;
     loadNews();
   }, NEWS_FEED, { asked: category });
@@ -766,10 +774,14 @@ window.NewsView = ({ apiKey, onClose, onUpgradeClick, theme, activeTab, onTabCha
                     every second and stays outside it. */}
                 {/* What did not load, pointing to the panel: "Nothing below is
                     missing data" is the panel's sentence. */}
-                <p role="status" data-own-fail="news" data-see-panel="true" style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px' }}>
-                  {RLW.panelLine('The news')}
+                {/* Only while the panel is up: once it has gone the line
+                    names the reason itself, never a pointer to nothing. */}
+                <p role="status" data-own-fail="news" data-see-panel={RLW.panelUp() ? 'true' : undefined} style={{ color: isDark ? C3.textMutedDark : C3.textMutedLight, marginBottom: '16px' }}>
+                  {RLW.panelUp() ? RLW.panelLine('The news') : notServedText(errorFail)}
                 </p>
-                <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onClick={() => { retryFocusRef.current = true; loadNews(true); }} style={{
+                {/* A press is the person acting: its failure gets its own
+                    repeat after the wait, as the line above's Try again. */}
+                <RLW.RetryButton wait={rlWait} isDark={isDark} data-retry-focus="true" onClick={() => { RLW.acted(NEWS_FEED); retryFocusRef.current = true; loadNews(true); }} style={{
                   padding: '12px 24px', background: C3.logoGradient, border: 'none',
                   borderRadius: '12px', color: 'white', fontSize: '14px', fontWeight: '600', cursor: 'pointer',
                 }} />
